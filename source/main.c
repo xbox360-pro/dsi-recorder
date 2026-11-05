@@ -7,7 +7,7 @@
 //   A          start / stop recording
 //   L / R      switch inner / outer camera
 //   X          toggle microphone audio (when not recording)
-//   UP / DOWN  change frame rate (when not recording)
+//   UP / DOWN  move the FPS slider (or tap/drag it on the touch screen)
 //   START      quit
 
 #include <dirent.h>
@@ -42,9 +42,23 @@
 #define VBLANK_RATE_NUM  598261
 #define VBLANK_RATE_DEN  10000
 
-static const u8 fpsChoices[] = { 2, 3, 4, 5, 6 };   // vblanks per frame
-static const char *fpsNames[] = { "30", "20", "15", "12", "10" };
-static int fpsSel = 2;                                // 15 fps default
+// FPS slider: position 0..FPS_STEPS-1, left = slowest, right = 60 fps.
+// vblanks per frame = FPS_STEPS - position  (12 -> ~5 fps ... 1 -> ~60 fps)
+#define FPS_STEPS     12
+#define SLIDER_ROW    3     // console row of the slider
+#define SLIDER_COL    9     // first cell column (after "FPS:    [")
+static int fpsSel = FPS_STEPS - 4;                    // 4 vblanks = ~15 fps default
+
+static int fpsVblanks(void)
+{
+    return FPS_STEPS - fpsSel;
+}
+
+// fps * 10, rounded (e.g. 150 = 15.0 fps)
+static int fpsTenths(int vblanks)
+{
+    return (VBLANK_RATE_NUM * 10 / VBLANK_RATE_DEN + vblanks / 2) / vblanks;
+}
 
 // ---------------------------------------------------------------------------
 // Camera frame ring (filled by NDMA, managed from the VBlank IRQ)
@@ -249,7 +263,7 @@ static void startRecording(void)
     mkdir(REC_DIR, 0777);
     snprintf(recPath, sizeof(recPath), REC_DIR "/REC_%04d.AVI", nextFileNumber());
 
-    vblanksPerFrame = fpsChoices[fpsSel];
+    vblanksPerFrame = fpsVblanks();
     if (!aviOpen(&avi, recPath, FRAME_W, FRAME_H, VBLANK_RATE_NUM,
                  VBLANK_RATE_DEN * vblanksPerFrame, useAudio, AUDIO_RATE))
     {
@@ -366,7 +380,15 @@ static void drawUi(int camera)
     printf("--------------------------------\n");
     printf("Camera: %-6s   Audio: %-3s    \n", camera == CAMERA_INNER ? "inner" : "outer",
            useAudio ? "on" : "off");
-    printf("FPS:    %-3s                    \n", fpsNames[fpsSel]);
+    {
+        char bar[FPS_STEPS + 1];
+        for (int i = 0; i < FPS_STEPS; i++)
+            bar[i] = (i <= fpsSel) ? '=' : '-';
+        bar[fpsSel] = recording ? '|' : 'O';
+        bar[FPS_STEPS] = '\0';
+        int t = fpsTenths(fpsVblanks());
+        printf("FPS:    [%s] %2d.%d   \n", bar, t / 10, t % 10);
+    }
     printf("--------------------------------\n");
 
     if (recording)
@@ -396,7 +418,7 @@ static void drawUi(int camera)
     printf("A       Start / stop recording\n");
     printf("L / R   Switch camera\n");
     printf("X       Toggle audio\n");
-    printf("UP/DOWN Change FPS\n");
+    printf("UP/DOWN FPS slider (or touch)\n");
     printf("START   Quit\n");
     printf("\nSaves to sd:/DSiRecorder/\n");
 }
@@ -505,11 +527,30 @@ int main(int argc, char **argv)
         {
             if (down & KEY_X)
                 useAudio = !useAudio;
-            if ((down & KEY_UP) && fpsSel > 0)
-                fpsSel--;
-            if ((down & KEY_DOWN) && fpsSel < (int)sizeof(fpsChoices) - 1)
+            int oldSel = fpsSel;
+            if ((down & KEY_UP) && fpsSel < FPS_STEPS - 1)
                 fpsSel++;
-            if (down & (KEY_X | KEY_UP | KEY_DOWN))
+            if ((down & KEY_DOWN) && fpsSel > 0)
+                fpsSel--;
+
+            // Tap or drag on the slider row
+            if (keysHeld() & KEY_TOUCH)
+            {
+                touchPosition tp;
+                touchRead(&tp);
+                int row = tp.py / 8;
+                if (row >= SLIDER_ROW - 1 && row <= SLIDER_ROW + 1)
+                {
+                    int cell = tp.px / 8 - SLIDER_COL;
+                    if (cell < 0)
+                        cell = 0;
+                    if (cell > FPS_STEPS - 1)
+                        cell = FPS_STEPS - 1;
+                    fpsSel = cell;
+                }
+            }
+
+            if ((down & KEY_X) || fpsSel != oldSel)
                 uiTimer = 0;
         }
 
