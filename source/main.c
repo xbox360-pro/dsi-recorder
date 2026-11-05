@@ -7,7 +7,7 @@
 //   A          start / stop recording
 //   L / R      switch inner / outer camera
 //   X          toggle microphone audio (when not recording)
-//   UP / DOWN  move the FPS slider (or tap/drag it on the touch screen)
+//   UP / DOWN  FPS slider 0.1 - 40 fps (hold to scroll, or tap/drag on touch screen)
 //   START      quit
 
 #include <dirent.h>
@@ -38,26 +38,33 @@
 #define REC_DIR        "/DSiRecorder"
 #define MAX_FILE_BYTES (1900u * 1024u * 1024u)   // stay well under RIFF/AVI 1.0 2 GB limit
 
-// DS refresh rate is ~59.8261 Hz. Recording fps = 59.8261 / vblanksPerFrame.
+// DS refresh rate is ~59.8261 Hz (used to turn VBlank counts into seconds).
 #define VBLANK_RATE_NUM  598261
 #define VBLANK_RATE_DEN  10000
 
-// FPS slider: position 0..FPS_STEPS-1, left = slowest, right = 60 fps.
-// vblanks per frame = FPS_STEPS - position  (12 -> ~5 fps ... 1 -> ~60 fps)
-#define FPS_STEPS     12
+// FPS slider, stored in tenths of a frame per second: 1 (0.1 fps) .. 400 (40.0 fps).
+#define FPS_MIN_T     1
+#define FPS_MAX_T     400
+#define SLIDER_CELLS  16
 #define SLIDER_ROW    3     // console row of the slider
 #define SLIDER_COL    9     // first cell column (after "FPS:    [")
-static int fpsSel = FPS_STEPS - 4;                    // 4 vblanks = ~15 fps default
+static int fpsT = 150;                                // 15.0 fps default
 
-static int fpsVblanks(void)
+static int fpsStepUp(int t)   { return t < 10 ? t + 1 : (t < 400 ? ((t / 10) + 1) * 10 : t); }
+static int fpsStepDown(int t) { return t > 10 ? ((t - 1) / 10) * 10 : (t > FPS_MIN_T ? t - 1 : t); }
+
+// Slider cell <-> fps (cell 0 = 0.1 fps, last cell = 40 fps, linear in between)
+static int fpsFromCell(int cell)
 {
-    return FPS_STEPS - fpsSel;
+    if (cell <= 0)
+        return FPS_MIN_T;
+    int t = (cell * FPS_MAX_T + (SLIDER_CELLS - 1) / 2) / (SLIDER_CELLS - 1);
+    return ((t + 5) / 10) * 10;   // whole fps when tapping
 }
 
-// fps * 10, rounded (e.g. 150 = 15.0 fps)
-static int fpsTenths(int vblanks)
+static int cellFromFps(int t)
 {
-    return (VBLANK_RATE_NUM * 10 / VBLANK_RATE_DEN + vblanks / 2) / vblanks;
+    return (t * (SLIDER_CELLS - 1) + FPS_MAX_T / 2) / FPS_MAX_T;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +190,7 @@ static u8 *batchBuf;
 static u32 batchCap;
 static u32 recStartVblank;
 static u32 lastWrittenSeq;
-static u32 vblanksPerFrame;
+static u32 recFpsT;                // fps * 10 for the current recording
 static char recPath[64];
 static char statusMsg[33] = "";
 
@@ -263,9 +270,8 @@ static void startRecording(void)
     mkdir(REC_DIR, 0777);
     snprintf(recPath, sizeof(recPath), REC_DIR "/REC_%04d.AVI", nextFileNumber());
 
-    vblanksPerFrame = fpsVblanks();
-    if (!aviOpen(&avi, recPath, FRAME_W, FRAME_H, VBLANK_RATE_NUM,
-                 VBLANK_RATE_DEN * vblanksPerFrame, useAudio, AUDIO_RATE))
+    recFpsT = fpsT;
+    if (!aviOpen(&avi, recPath, FRAME_W, FRAME_H, recFpsT, 10, useAudio, AUDIO_RATE))
     {
         snprintf(statusMsg, sizeof(statusMsg), "Can't create file!");
         return;
@@ -312,9 +318,20 @@ static void stopRecording(const char *reason)
 static void recordTick(void)
 {
     u32 elapsed = vblankCount - recStartVblank;
-    u32 slotsDue = elapsed / vblanksPerFrame + 1;
+    // frames due = elapsed seconds * fps   (seconds = vblanks * DEN / NUM)
+    u32 slotsDue = (u32)(((u64)elapsed * VBLANK_RATE_DEN * recFpsT) /
+                         ((u64)VBLANK_RATE_NUM * 10)) + 1;
     if (slotsDue <= avi.videoFrames)
+    {
+        // No video slot yet (slow frame rates): still drain audio so the ring never overflows
+        if (useAudio && audioAvailable() >= 32 * 1024)
+        {
+            u32 n = batchAudio(0, batchCap);
+            if (!aviCommit(&avi, batchBuf, n) || avi.failed)
+                stopRecording("SD write failed / full!");
+        }
         return;
+    }
 
     u32 missing = slotsDue - avi.videoFrames;
     if (missing > 64)
@@ -381,19 +398,19 @@ static void drawUi(int camera)
     printf("Camera: %-6s   Audio: %-3s    \n", camera == CAMERA_INNER ? "inner" : "outer",
            useAudio ? "on" : "off");
     {
-        char bar[FPS_STEPS + 1];
-        for (int i = 0; i < FPS_STEPS; i++)
-            bar[i] = (i <= fpsSel) ? '=' : '-';
-        bar[fpsSel] = recording ? '|' : 'O';
-        bar[FPS_STEPS] = '\0';
-        int t = fpsTenths(fpsVblanks());
-        printf("FPS:    [%s] %2d.%d   \n", bar, t / 10, t % 10);
+        char bar[SLIDER_CELLS + 1];
+        int pos = cellFromFps(fpsT);
+        for (int i = 0; i < SLIDER_CELLS; i++)
+            bar[i] = (i <= pos) ? '=' : '-';
+        bar[pos] = recording ? '|' : 'O';
+        bar[SLIDER_CELLS] = '\0';
+        printf("FPS:    [%s]%2d.%d \n", bar, fpsT / 10, fpsT % 10);
     }
     printf("--------------------------------\n");
 
     if (recording)
     {
-        u32 secs = (avi.videoFrames * vblanksPerFrame * VBLANK_RATE_DEN) / VBLANK_RATE_NUM;
+        u32 secs = (u32)(((u64)avi.videoFrames * 10) / recFpsT);
         u32 dropped = avi.videoFrames - avi.realFrames;
         printf("\x1b[31m** REC **\x1b[39m  %02lu:%02lu            \n",
                (unsigned long)(secs / 60), (unsigned long)(secs % 60));
@@ -484,6 +501,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    keysSetRepeat(20, 4);
     irqSet(IRQ_VBLANK, vblankHandler);
     irqEnable(IRQ_VBLANK);
 
@@ -527,11 +545,12 @@ int main(int argc, char **argv)
         {
             if (down & KEY_X)
                 useAudio = !useAudio;
-            int oldSel = fpsSel;
-            if ((down & KEY_UP) && fpsSel < FPS_STEPS - 1)
-                fpsSel++;
-            if ((down & KEY_DOWN) && fpsSel > 0)
-                fpsSel--;
+            int oldFps = fpsT;
+            u16 rep = keysDownRepeat();   // hold Up/Down to scroll
+            if (rep & KEY_UP)
+                fpsT = fpsStepUp(fpsT);
+            if (rep & KEY_DOWN)
+                fpsT = fpsStepDown(fpsT);
 
             // Tap or drag on the slider row
             if (keysHeld() & KEY_TOUCH)
@@ -544,13 +563,13 @@ int main(int argc, char **argv)
                     int cell = tp.px / 8 - SLIDER_COL;
                     if (cell < 0)
                         cell = 0;
-                    if (cell > FPS_STEPS - 1)
-                        cell = FPS_STEPS - 1;
-                    fpsSel = cell;
+                    if (cell > SLIDER_CELLS - 1)
+                        cell = SLIDER_CELLS - 1;
+                    fpsT = fpsFromCell(cell);
                 }
             }
 
-            if ((down & KEY_X) || fpsSel != oldSel)
+            if ((down & KEY_X) || fpsT != oldFps)
                 uiTimer = 0;
         }
 
