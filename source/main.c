@@ -8,6 +8,7 @@
 //   L / R      switch inner / outer camera
 //   X          toggle microphone audio (when not recording)
 //   UP / DOWN  FPS slider 0.1 - 60 fps (hold to scroll, or tap/drag on touch screen)
+//   SELECT     video viewer (play back recordings)
 //   START      quit
 
 #include <dirent.h>
@@ -22,6 +23,7 @@
 #include <nds.h>
 
 #include "avi.h"
+#include "player.h"
 
 #define CAMERA_NDMA_CHANNEL 1
 
@@ -76,7 +78,7 @@ static volatile int camLatest = -1;     // newest complete frame
 static volatile int camLocked = -1;     // buffer the main loop is encoding
 static volatile u32 camFrameSeq = 0;    // increments on each completed frame
 static volatile bool camPaused = true;  // main loop owns the camera while true
-static volatile u32 vblankCount = 0;
+volatile u32 vblankCount = 0;          // also used by the video viewer
 static u32 displayedSeq = 0;
 static u16 *previewVram;
 
@@ -436,8 +438,9 @@ static void drawUi(int camera)
     printf("L / R   Switch camera\n");
     printf("X       Toggle audio\n");
     printf("UP/DOWN FPS slider (or touch)\n");
+    printf("SELECT  Watch videos\n");
     printf("START   Quit\n");
-    printf("\nSaves to sd:/DSiRecorder/\n");
+    printf("Saves to sd:/DSiRecorder/\n");
 }
 
 int main(int argc, char **argv)
@@ -539,6 +542,17 @@ int main(int argc, char **argv)
             if (!cameraResume())
                 snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
             uiTimer = 0;
+        }
+
+        if ((down & KEY_SELECT) && !recording)
+        {
+            cameraPause();
+            runViewer(previewVram);
+            if (!cameraResume())
+                snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
+            consoleClear();
+            uiTimer = 0;
+            continue;
         }
 
         if (!recording)
