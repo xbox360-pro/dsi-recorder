@@ -7,7 +7,7 @@
 //   A          start / stop recording
 //   L / R      switch inner / outer camera
 //   X          toggle microphone audio (when not recording)
-//   UP / DOWN  FPS slider 0.1 - 40 fps (hold to scroll, or tap/drag on touch screen)
+//   UP / DOWN  FPS slider 0.1 - 60 fps (hold to scroll, or tap/drag on touch screen)
 //   START      quit
 
 #include <dirent.h>
@@ -42,18 +42,18 @@
 #define VBLANK_RATE_NUM  598261
 #define VBLANK_RATE_DEN  10000
 
-// FPS slider, stored in tenths of a frame per second: 1 (0.1 fps) .. 400 (40.0 fps).
+// FPS slider, stored in tenths of a frame per second: 1 (0.1 fps) .. 600 (60.0 fps).
 #define FPS_MIN_T     1
-#define FPS_MAX_T     400
+#define FPS_MAX_T     600
 #define SLIDER_CELLS  16
 #define SLIDER_ROW    3     // console row of the slider
 #define SLIDER_COL    9     // first cell column (after "FPS:    [")
 static int fpsT = 150;                                // 15.0 fps default
 
-static int fpsStepUp(int t)   { return t < 10 ? t + 1 : (t < 400 ? ((t / 10) + 1) * 10 : t); }
+static int fpsStepUp(int t)   { return t < 10 ? t + 1 : (t < FPS_MAX_T ? ((t / 10) + 1) * 10 : t); }
 static int fpsStepDown(int t) { return t > 10 ? ((t - 1) / 10) * 10 : (t > FPS_MIN_T ? t - 1 : t); }
 
-// Slider cell <-> fps (cell 0 = 0.1 fps, last cell = 40 fps, linear in between)
+// Slider cell <-> fps (cell 0 = 0.1 fps, last cell = 60 fps, linear in between)
 static int fpsFromCell(int cell)
 {
     if (cell <= 0)
