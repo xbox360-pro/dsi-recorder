@@ -321,6 +321,7 @@ static void drawPlayUi(const char *name, int pressedBtn)
     }
 
     // Progress
+    uiCard(8, 84, 240, 32, COL_CARD, COL_CARD_EDGE);
     uiText(2, 11, TXT_WHITE, "%02lu:%02lu", (unsigned long)(cur / 60), (unsigned long)(cur % 60));
     if (total)
         uiText(25, 11, TXT_MUTED, "%02lu:%02lu", (unsigned long)(total / 60),
