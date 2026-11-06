@@ -68,6 +68,16 @@ static volatile bool camPaused = true;  // main loop owns the camera while true
 volatile u32 vblankCount = 0;          // also used by the video viewer
 static u32 displayedSeq = 0;
 static u16 *previewVram;
+static volatile u32 camBusyVbl = 0;     // VBlanks the current transfer has been running
+
+// A camera FIFO overrun (e.g. the memory bus was busy for too long) leaves the
+// NDMA transfer waiting forever. Abort it and clear the camera FIFO.
+static void cameraKick(void)
+{
+    REG_NDMA_CR(CAMERA_NDMA_CHANNEL) = 0;
+    cameraStopTransfer();
+    REG_CAM_CNT |= CAM_CNT_TRANSFER_FLUSH;   // also clears the overrun flag
+}
 
 static int pickFreeBuffer(void)
 {
@@ -85,7 +95,17 @@ static void vblankHandler(void)
 
     if (!camPaused)
     {
-        if (!ndmaBusy(CAMERA_NDMA_CHANNEL))
+        bool busy = ndmaBusy(CAMERA_NDMA_CHANNEL);
+
+        // Watchdog: a frame never takes this long; the transfer is stuck
+        if (busy && (++camBusyVbl > 30 || (REG_CAM_CNT & CAM_CNT_TRANSFER_ERROR)))
+        {
+            cameraKick();
+            camWriting = -1;                     // drop the partial frame
+            busy = false;
+        }
+
+        if (!busy)
         {
             // Previous transfer finished
             cameraStopTransfer();
@@ -94,6 +114,7 @@ static void vblankHandler(void)
                 camLatest = camWriting;
                 camFrameSeq++;
             }
+            camBusyVbl = 0;
             camWriting = pickFreeBuffer();
             cameraStartTransfer(frameBuf[camWriting], MCUREG_APT_SEQ_CMD_PREVIEW,
                                 CAMERA_NDMA_CHANNEL);
@@ -112,8 +133,11 @@ static void vblankHandler(void)
 static void cameraPause(void)
 {
     camPaused = true;
-    while (ndmaBusy(CAMERA_NDMA_CHANNEL))
+    u32 start = vblankCount;
+    while (ndmaBusy(CAMERA_NDMA_CHANNEL) && vblankCount - start < 30)
         ;
+    if (ndmaBusy(CAMERA_NDMA_CHANNEL))
+        cameraKick();                            // stuck: don't hang the app
     cameraStopTransfer();
     camWriting = -1;
 }
@@ -129,6 +153,7 @@ static bool cameraResume(void)
     if (!cameraStartTransfer(frameBuf[b], MCUREG_APT_SEQ_CMD_PREVIEW, CAMERA_NDMA_CHANNEL))
         return false;
     camWriting = b;
+    camBusyVbl = 0;
     camPaused = false;
     return true;
 }
