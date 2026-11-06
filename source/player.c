@@ -20,6 +20,7 @@
 #include <nds.h>
 
 #include "player.h"
+#include "ui.h"
 
 extern volatile u32 vblankCount;     // incremented by main.c's VBlank handler
 
@@ -40,7 +41,6 @@ extern volatile u32 vblankCount;     // incremented by main.c's VBlank handler
 #define FCC(a, b, c, d) ((u32)(a) | ((u32)(b) << 8) | ((u32)(c) << 16) | ((u32)(d) << 24))
 
 #define MAX_FILES    256
-#define LIST_ROWS    16
 
 // ---------------------------------------------------------------------------
 // Playback state
@@ -285,38 +285,70 @@ static void fill(void)
     }
 }
 
-static void drawPlayUi(const char *name)
+static const UiBox pbRestart = { 8, 120, 76, 24 };
+static const UiBox pbSkip = { 90, 120, 76, 24 };
+static const UiBox pbBack = { 172, 120, 76, 24 };
+static const UiBox pbPlay = { 8, 148, 240, 32 };
+
+static bool ended(void)
+{
+    return eof && qCount == 0;
+}
+
+static void drawPlayUi(const char *name, int pressedBtn)
 {
     u32 cur = (u32)(((u64)playVbl * VB_DEN) / VB_NUM);
     u32 total = (u32)(((u64)totalFrames * vidScale) / vidRate);
-    printf("\x1b[0;0H");
-    printf("        Video viewer            \n");
-    printf("--------------------------------\n");
-    printf("%-32.32s", name);
-    printf("%2lu.%lu fps   audio: %-3s         \n", (unsigned long)(vidRate * 10 / vidScale / 10),
-           (unsigned long)(vidRate * 10 / vidScale % 10), hasAudio ? "on" : "off");
-    printf("--------------------------------\n");
-    printf("%s  %02lu:%02lu / %02lu:%02lu         \n",
-           paused ? "Paused " : (eof && qCount == 0 ? "Ended  " : "Playing"),
-           (unsigned long)(cur / 60), (unsigned long)(cur % 60),
-           (unsigned long)(total / 60), (unsigned long)(total % 60));
+    if (total && cur > total)
+        cur = total;
 
-    // progress bar
-    char bar[31];
-    int p = total ? (int)((u64)cur * 30 / total) : 0;
-    if (p > 30)
-        p = 30;
-    for (int i = 0; i < 30; i++)
-        bar[i] = i < p ? '=' : '-';
-    bar[30] = '\0';
-    printf("[%s]\n", bar);
+    uiBegin();
+    uiHeader("Now playing");
 
-    printf("\x1b[16;0H");
-    printf("--------------------------------\n");
-    printf("A       Pause / play            \n");
-    printf("R       Skip ahead 5 s          \n");
-    printf("L       Restart                 \n");
-    printf("B       Back to list            \n");
+    uiCard(8, 32, 240, 48, COL_CARD, COL_CARD_EDGE);
+    uiText(2, 5, TXT_WHITE, "%.28s", name);
+    uiText(2, 6, TXT_MUTED, "%lu.%lu fps", (unsigned long)(vidRate * 10 / vidScale / 10),
+           (unsigned long)(vidRate * 10 / vidScale % 10));
+    uiText(14, 6, hasAudio ? TXT_GREEN : TXT_MUTED, "%s", hasAudio ? "with sound" : "no sound");
+    if (paused)
+        uiText(2, 8, TXT_AMBER, "Paused");
+    else if (ended())
+        uiText(2, 8, TXT_ACCENT, "Finished");
+    else
+    {
+        uiCircle(19, 68, 3, COL_GREEN);
+        uiText(3, 8, TXT_GREEN, "Playing");
+    }
+
+    // Progress
+    uiText(2, 11, TXT_WHITE, "%02lu:%02lu", (unsigned long)(cur / 60), (unsigned long)(cur % 60));
+    if (total)
+        uiText(25, 11, TXT_MUTED, "%02lu:%02lu", (unsigned long)(total / 60),
+               (unsigned long)(total % 60));
+    int pos = total ? (int)((u64)cur * 1000 / total) : (ended() ? 1000 : 0);
+    uiSlider(24, 104, 208, pos, true, COL_ACCENT);
+
+    uiButton(pbRestart, "Restart", pressedBtn == 1 ? 1 : 0);
+    uiButton(pbSkip, "+5 sec", ended() ? 2 : (pressedBtn == 2 ? 1 : 0));
+    uiButton(pbBack, "Back", pressedBtn == 3 ? 1 : 0);
+
+    // Big play / pause button
+    uiCard(pbPlay.x, pbPlay.y, pbPlay.w, pbPlay.h, pressedBtn == 4 ? COL_PRESSED : UIC(5, 14, 22),
+           COL_ACCENT);
+    if (paused || ended())
+    {
+        uiTriangleRight(96, 157, 15, COL_WHITE);
+        uiText(14, 20, TXT_WHITE, "%s", ended() ? "REPLAY" : "PLAY");
+    }
+    else
+    {
+        uiRect(94, 158, 4, 13, COL_WHITE);
+        uiRect(101, 158, 4, 13, COL_WHITE);
+        uiText(14, 20, TXT_WHITE, "PAUSE");
+    }
+
+    uiText(1, 23, TXT_MUTED, "A play/pause  R +5s  L restart");
+    uiPresent();
 }
 
 static void playFile(const char *name, u16 *vram)
@@ -324,15 +356,21 @@ static void playFile(const char *name, u16 *vram)
     char path[64];
     snprintf(path, sizeof(path), REC_DIR "/%s", name);
 
-    consoleClear();
     if (!openVideo(path))
     {
-        printf("Can't play %s\n\n(not a DSi Recorder video?)\n\nPress B", name);
+        uiBegin();
+        uiHeader("Now playing");
+        uiCard(8, 40, 240, 80, COL_CARD, COL_CARD_EDGE);
+        uiText(3, 7, TXT_AMBER, "Can't play this file");
+        uiText(3, 9, TXT_WHITE, "%.26s", name);
+        uiText(3, 11, TXT_MUTED, "Not a DSi Recorder video?");
+        uiText(3, 13, TXT_MUTED, "Tap or press B to go back");
+        uiPresent();
         while (1)
         {
             swiWaitForVBlank();
             scanKeys();
-            if (keysDown() & (KEY_B | KEY_A))
+            if (keysDown() & (KEY_B | KEY_A | KEY_TOUCH))
                 return;
         }
     }
@@ -350,12 +388,41 @@ static void playFile(const char *name, u16 *vram)
 
     u32 lastVbl = vblankCount;
     int uiTimer = 0;
+    int pressedBtn = 0;
 
     while (1)
     {
         swiWaitForVBlank();
         scanKeys();
         u32 down = keysDown();
+
+        // Touch buttons: highlight on press, act on release
+        int action = 0;
+        if (down & KEY_TOUCH)
+        {
+            touchPosition tp;
+            touchRead(&tp);
+            pressedBtn = uiHit(pbRestart, tp.px, tp.py) ? 1
+                       : uiHit(pbSkip, tp.px, tp.py)    ? 2
+                       : uiHit(pbBack, tp.px, tp.py)    ? 3
+                       : uiHit(pbPlay, tp.px, tp.py)    ? 4
+                                                        : 0;
+            uiTimer = 0;
+        }
+        if (keysUp() & KEY_TOUCH)
+        {
+            action = pressedBtn;
+            pressedBtn = 0;
+            uiTimer = 0;
+        }
+        if (action == 1)
+            down |= KEY_L;
+        if (action == 2)
+            down |= KEY_R;
+        if (action == 3)
+            down |= KEY_B;
+        if (action == 4)
+            down |= KEY_A;
 
         u32 now = vblankCount;
         if (!paused)
@@ -437,8 +504,8 @@ static void playFile(const char *name, u16 *vram)
 
         if (--uiTimer <= 0)
         {
-            drawPlayUi(name);
-            uiTimer = 10;
+            drawPlayUi(name, pressedBtn);
+            uiTimer = 15;
         }
     }
 
@@ -487,37 +554,66 @@ static void scanFiles(void)
     }
 }
 
-static void drawList(int sel, int top)
+#define ITEM_Y0  32
+#define ITEM_H   24
+#define ITEMS    5
+
+static const UiBox lbBack = { 8, 160, 54, 24 };
+static const UiBox lbUp = { 70, 160, 54, 24 };
+static const UiBox lbDown = { 132, 160, 54, 24 };
+static const UiBox lbPlay = { 194, 160, 54, 24 };
+
+static void drawList(int sel, int top, int pressedBtn)
 {
-    printf("\x1b[0;0H");
-    printf("    Video viewer - %3d files    \n", numFiles);
-    printf("--------------------------------\n");
-    for (int r = 0; r < LIST_ROWS; r++)
+    uiBegin();
+    uiHeader("Videos");
+    uiText(numFiles == 1 ? 24 : 23, 1, TXT_MUTED, "%d %s", numFiles, numFiles == 1 ? "file" : "files");
+
+    if (numFiles == 0)
+    {
+        uiCard(8, 40, 240, 80, COL_CARD, COL_CARD_EDGE);
+        uiText(3, 8, TXT_WHITE, "No videos yet");
+        uiText(3, 10, TXT_MUTED, "Record something first, then");
+        uiText(3, 11, TXT_MUTED, "it will show up here.");
+    }
+
+    for (int r = 0; r < ITEMS; r++)
     {
         int i = top + r;
-        if (i < numFiles)
-        {
-            u32 kb = sizesKb[i];
-            char sz[12];
-            if (kb >= 1024)
-                snprintf(sz, sizeof(sz), "%lu.%lu MB", (unsigned long)(kb / 1024),
-                         (unsigned long)((kb % 1024) * 10 / 1024));
-            else
-                snprintf(sz, sizeof(sz), "%lu KB", (unsigned long)kb);
-            printf("%c %-18.18s %10s\n", i == sel ? '>' : ' ', names[i], sz);
-        }
-        else if (i == 0 && numFiles == 0)
-        {
-            printf("  No videos yet.                \n");
-        }
+        if (i >= numFiles)
+            break;
+        int y = ITEM_Y0 + r * ITEM_H;
+        int row = (y + ITEM_H / 2 - 4) / 8;
+        bool s = i == sel;
+        uiCard(8, y + 1, 240, ITEM_H - 2, s ? UIC(6, 15, 23) : COL_CARD, s ? COL_ACCENT : COL_CARD_EDGE);
+        if (s)
+            uiTriangleRight(16, y + 8, 9, COL_WHITE);
         else
-        {
-            printf("                                \n");
-        }
+            uiCircle(19, y + 12, 2, COL_CARD_EDGE);
+
+        u32 kb = sizesKb[i];
+        uiText(4, row, TXT_WHITE, "%.17s", names[i]);
+        if (kb >= 1024)
+            uiText(20, row, s ? TXT_WHITE : TXT_MUTED, "%5lu.%lu MB", (unsigned long)(kb / 1024),
+                   (unsigned long)((kb % 1024) * 10 / 1024));
+        else
+            uiText(20, row, s ? TXT_WHITE : TXT_MUTED, "%7lu KB", (unsigned long)kb);
     }
-    printf("--------------------------------\n");
-    printf("UP/DOWN select   A play         \n");
-    printf("B       back to camera          ");
+
+    // scroll indicator
+    if (numFiles > ITEMS)
+    {
+        int h = ITEMS * ITEM_H * ITEMS / numFiles;
+        int y = ITEM_Y0 + (ITEMS * ITEM_H - h) * top / (numFiles - ITEMS);
+        uiRound(250, y, 3, h, 1, COL_CARD_EDGE);
+    }
+
+    bool any = numFiles > 0;
+    uiButton(lbBack, "Back", pressedBtn == 1 ? 1 : 0);
+    uiButton(lbUp, "Up", !any || sel == 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
+    uiButton(lbDown, "Down", !any || sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
+    uiButton(lbPlay, "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    uiPresent();
 }
 
 void runViewer(u16 *vram)
@@ -534,12 +630,15 @@ void runViewer(u16 *vram)
     for (int i = 0; i < NQ; i++)
         ok = ok && q[i];
 
-    consoleClear();
     memset(vram, 0, 256 * 192 * 2);
 
     if (!ok)
     {
-        printf("Not enough memory for viewer.\n\nPress B");
+        uiBegin();
+        uiHeader("Videos");
+        uiText(3, 8, TXT_AMBER, "Not enough memory for viewer");
+        uiText(3, 10, TXT_MUTED, "Press B to go back");
+        uiPresent();
         while (1)
         {
             swiWaitForVBlank();
@@ -553,12 +652,49 @@ void runViewer(u16 *vram)
         scanFiles();
         int sel = 0, top = 0;
         bool redraw = true;
+        int pressedBtn = 0;
         while (1)
         {
             swiWaitForVBlank();
             scanKeys();
             u32 down = keysDown();
             u32 rep = keysDownRepeat();
+
+            // Touch: tap a video to select it, tap it again (or Play) to watch
+            if (down & KEY_TOUCH)
+            {
+                touchPosition tp;
+                touchRead(&tp);
+                pressedBtn = uiHit(lbBack, tp.px, tp.py)   ? 1
+                           : uiHit(lbUp, tp.px, tp.py)     ? 2
+                           : uiHit(lbDown, tp.px, tp.py)   ? 3
+                           : uiHit(lbPlay, tp.px, tp.py)   ? 4
+                                                           : 0;
+                if (pressedBtn == 0 && tp.py >= ITEM_Y0 && tp.py < ITEM_Y0 + ITEMS * ITEM_H)
+                {
+                    int i = top + (tp.py - ITEM_Y0) / ITEM_H;
+                    if (i < numFiles)
+                    {
+                        if (i == sel)
+                            down |= KEY_A;
+                        sel = i;
+                    }
+                }
+                redraw = true;
+            }
+            if (keysUp() & KEY_TOUCH)
+            {
+                if (pressedBtn == 1)
+                    down |= KEY_B;
+                if (pressedBtn == 2)
+                    rep |= KEY_UP;
+                if (pressedBtn == 3)
+                    rep |= KEY_DOWN;
+                if (pressedBtn == 4)
+                    down |= KEY_A;
+                pressedBtn = 0;
+                redraw = true;
+            }
 
             if (down & KEY_B)
                 break;
@@ -575,18 +711,17 @@ void runViewer(u16 *vram)
             if ((down & KEY_A) && numFiles > 0)
             {
                 playFile(names[sel], vram);
-                consoleClear();
                 redraw = true;
             }
 
             if (sel < top)
                 top = sel;
-            if (sel >= top + LIST_ROWS)
-                top = sel - LIST_ROWS + 1;
+            if (sel >= top + ITEMS)
+                top = sel - ITEMS + 1;
 
             if (redraw)
             {
-                drawList(sel, top);
+                drawList(sel, top, pressedBtn);
                 redraw = false;
             }
         }
@@ -598,5 +733,4 @@ void runViewer(u16 *vram)
     free(ring);
     free(names);
     free(sizesKb);
-    consoleClear();
 }
