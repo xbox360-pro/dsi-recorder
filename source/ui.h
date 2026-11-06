@@ -47,6 +47,11 @@ typedef struct
 
 void uiInit(void);
 
+// Optional custom theme: loads a .bmp (24/32-bit, any size) and uses it as the
+// header icon and as a faded tiled pattern behind the UI. Returns false if the
+// file is missing or not a supported BMP (the default look is kept).
+bool uiLoadTheme(const char *path);
+
 // Start a new frame: background into the canvas, text layer cleared
 void uiBegin(void);
 // Push the canvas to the screen
