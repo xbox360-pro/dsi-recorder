@@ -13,8 +13,8 @@ static u16 *canvas;      // back buffer
 static u16 *background;  // cached background gradient
 
 #define ICON_SIZE 18
-#define TILE_SIZE 64
 static bool haveTheme;
+static int fillAlpha = 256;     // < 256: shapes are blended over the background (theme mode)
 static u16 icon[ICON_SIZE * ICON_SIZE];
 
 static int isqrt(int v)
@@ -36,8 +36,20 @@ static void hline(int x0, int x1, int y, u16 c)
     if (x1 > UI_W)
         x1 = UI_W;
     u16 *p = canvas + y * UI_W;
+    if (fillAlpha >= 256)
+    {
+        for (int x = x0; x < x1; x++)
+            p[x] = c;
+        return;
+    }
+    int a = fillAlpha, ia = 256 - a;
+    int cr = c & 31, cg = (c >> 5) & 31, cb = (c >> 10) & 31;
     for (int x = x0; x < x1; x++)
-        p[x] = c;
+    {
+        u16 o = p[x];
+        p[x] = UIC((cr * a + (o & 31) * ia) >> 8, (cg * a + ((o >> 5) & 31) * ia) >> 8,
+                   (cb * a + ((o >> 10) & 31) * ia) >> 8);
+    }
 }
 
 static u16 mix(int r0, int g0, int b0, int r1, int g1, int b1, int t, int n)
@@ -145,14 +157,27 @@ void uiTriangleRight(int x, int y, int h, u16 c)
 
 void uiCard(int x, int y, int w, int h, u16 fill, u16 edge)
 {
+    if (haveTheme)
+    {
+        // Frosted-glass look: the picture shows through cards and buttons
+        fillAlpha = 220;
+        uiRound(x, y, w, h, 6, edge);
+        fillAlpha = 190;
+        uiRound(x + 1, y + 1, w - 2, h - 2, 5, fill);
+        fillAlpha = 256;
+        return;
+    }
     uiRound(x, y, w, h, 6, edge);
     uiRound(x + 1, y + 1, w - 2, h - 2, 5, fill);
 }
 
 void uiHeader(const char *title)
 {
+    if (haveTheme)
+        fillAlpha = 200;
     for (int y = 0; y < 22; y++)
         hline(0, UI_W, y, mix(6, 8, 17, 3, 4, 10, y, 22));
+    fillAlpha = 256;
     hline(0, UI_W, 22, COL_ACCENT);
     hline(0, UI_W, 23, UIC(3, 10, 15));
     if (haveTheme)
@@ -234,25 +259,30 @@ static u32 le32(const u8 *p)
     return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24);
 }
 
-// Samples a size x size square from the centre of the BMP into out (DS colors)
-static bool sampleSquare(FILE *f, u32 dataOff, int w, int h, bool topDown, int bpp, u8 *row,
-                         u32 rowBytes, u16 *out, int size)
+// Samples the BMP into an outW x outH image, cropping the centre to that aspect
+// ratio ("cover" fit), into out (DS colors).
+static bool sampleCover(FILE *f, u32 dataOff, int w, int h, bool topDown, int bpp, u8 *row,
+                        u32 rowBytes, u16 *out, int outW, int outH)
 {
-    int side = w < h ? w : h;
-    int x0 = (w - side) / 2;
-    int y0 = (h - side) / 2;
-    for (int ty = 0; ty < size; ty++)
+    int cw = w, ch = h;
+    if ((long)w * outH > (long)h * outW)
+        cw = (int)((long)h * outW / outH);      // source too wide: crop the sides
+    else
+        ch = (int)((long)w * outH / outW);      // source too tall: crop top/bottom
+    int x0 = (w - cw) / 2;
+    int y0 = (h - ch) / 2;
+    for (int ty = 0; ty < outH; ty++)
     {
-        int sy = y0 + (ty * side + side / 2) / size;       // row from the top
+        int sy = y0 + (int)(((long)ty * ch + ch / 2) / outH);   // row from the top
         int fileRow = topDown ? sy : (h - 1 - sy);
         if (fseek(f, dataOff + (long)fileRow * rowBytes, SEEK_SET) != 0 ||
             fread(row, 1, rowBytes, f) != rowBytes)
             return false;
-        for (int tx = 0; tx < size; tx++)
+        for (int tx = 0; tx < outW; tx++)
         {
-            int sx = x0 + (tx * side + side / 2) / size;
+            int sx = x0 + (int)(((long)tx * cw + cw / 2) / outW);
             const u8 *px = row + sx * (bpp / 8);
-            out[ty * size + tx] = UIC(px[2] >> 3, px[1] >> 3, px[0] >> 3);
+            out[ty * outW + tx] = UIC(px[2] >> 3, px[1] >> 3, px[0] >> 3);
         }
     }
     return true;
@@ -286,25 +316,30 @@ bool uiLoadTheme(const char *path)
 
     u32 rowBytes = ((u32)w * (bpp / 8) + 3) & ~3u;
     u8 *row = malloc(rowBytes);
-    u16 *tile = malloc(TILE_SIZE * TILE_SIZE * 2);
-    ok = row && tile &&
-         sampleSquare(f, dataOff, w, h, topDown, bpp, row, rowBytes, icon, ICON_SIZE) &&
-         sampleSquare(f, dataOff, w, h, topDown, bpp, row, rowBytes, tile, TILE_SIZE);
+    u16 *full = malloc(UI_W * UI_H * 2);
+    ok = row && full &&
+         sampleCover(f, dataOff, w, h, topDown, bpp, row, rowBytes, icon, ICON_SIZE, ICON_SIZE) &&
+         sampleCover(f, dataOff, w, h, topDown, bpp, row, rowBytes, full, UI_W, UI_H);
     fclose(f);
 
     if (ok)
     {
-        // Rebuild the background: gradient with the picture tiled over it at ~22%
+        // Background = the picture filling the whole screen, slightly dimmed, with a
+        // soft dark vignette toward the edges so text and buttons stay readable.
         for (int y = 0; y < UI_H; y++)
         {
-            u16 base = mix(4, 5, 11, 1, 1, 3, y, UI_H);
-            int br = base & 31, bg = (base >> 5) & 31, bb = (base >> 10) & 31;
+            int dy = (y - UI_H / 2) * 256 / (UI_H / 2);
             for (int x = 0; x < UI_W; x++)
             {
-                u16 t = tile[(y % TILE_SIZE) * TILE_SIZE + (x % TILE_SIZE)];
-                int r = (br * 78 + (t & 31) * 22) / 100;
-                int g = (bg * 78 + ((t >> 5) & 31) * 22) / 100;
-                int b = (bb * 78 + ((t >> 10) & 31) * 22) / 100;
+                int dx = (x - UI_W / 2) * 256 / (UI_W / 2);
+                int d2 = (dx * dx + dy * dy) >> 8;          // 0 centre .. ~512 corners
+                int keep = 215 - d2 / 4;                     // brightness kept, /256
+                if (keep < 120)
+                    keep = 120;
+                u16 t = full[y * UI_W + x];
+                int r = ((t & 31) * keep) >> 8;
+                int g = (((t >> 5) & 31) * keep) >> 8;
+                int b = (((t >> 10) & 31) * keep) >> 8;
                 background[y * UI_W + x] = UIC(r, g, b);
             }
         }
@@ -312,6 +347,6 @@ bool uiLoadTheme(const char *path)
     }
 
     free(row);
-    free(tile);
+    free(full);
     return ok;
 }
