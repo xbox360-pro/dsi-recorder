@@ -508,6 +508,7 @@ static void drawUi(int camera)
     }
 
     // Frame-rate slider
+    uiCard(8, 84, 240, 32, COL_CARD, COL_CARD_EDGE);
     uiText(2, 11, TXT_MUTED, "Frame rate");
     uiText(fpsT >= 100 ? 21 : 22, 11, TXT_WHITE, "%d.%d fps", fpsT / 10, fpsT % 10);
     uiSlider(SLIDER_X, SLIDER_Y, SLIDER_W, fpsToPos(fpsT), !recording,
