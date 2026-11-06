@@ -12,6 +12,11 @@ static u16 *vram;        // sub BG3 bitmap
 static u16 *canvas;      // back buffer
 static u16 *background;  // cached background gradient
 
+#define ICON_SIZE 18
+#define TILE_SIZE 64
+static bool haveTheme;
+static u16 icon[ICON_SIZE * ICON_SIZE];
+
 static int isqrt(int v)
 {
     if (v <= 0)
@@ -146,8 +151,20 @@ void uiHeader(const char *title)
         hline(0, UI_W, y, mix(6, 8, 17, 3, 4, 10, y, 22));
     hline(0, UI_W, 22, COL_ACCENT);
     hline(0, UI_W, 23, UIC(3, 10, 15));
-    uiCircle(13, 11, 4, COL_ACCENT);
-    uiText(3, 1, TXT_WHITE, "%s", title);
+    if (haveTheme)
+    {
+        // custom picture in the top-left corner, with an accent frame
+        uiRect(1, 1, ICON_SIZE + 2, ICON_SIZE + 2, COL_ACCENT);
+        for (int y = 0; y < ICON_SIZE; y++)
+            for (int x = 0; x < ICON_SIZE; x++)
+                canvas[(y + 2) * UI_W + x + 2] = icon[y * ICON_SIZE + x];
+        uiText(3, 1, TXT_WHITE, " %s", title);
+    }
+    else
+    {
+        uiCircle(13, 11, 4, COL_ACCENT);
+        uiText(3, 1, TXT_WHITE, "%s", title);
+    }
 }
 
 void uiText(int col, int row, int color, const char *fmt, ...)
@@ -203,4 +220,94 @@ void uiSlider(int x, int y, int w, int pos, bool knob, u16 fill)
 bool uiHit(UiBox b, int px, int py)
 {
     return px >= b.x && px < b.x + b.w && py >= b.y && py < b.y + b.h;
+}
+
+// ---------------------------------------------------------------------------
+// Custom theme picture
+
+static u32 le32(const u8 *p)
+{
+    return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24);
+}
+
+// Samples a size x size square from the centre of the BMP into out (DS colors)
+static bool sampleSquare(FILE *f, u32 dataOff, int w, int h, bool topDown, int bpp, u8 *row,
+                         u32 rowBytes, u16 *out, int size)
+{
+    int side = w < h ? w : h;
+    int x0 = (w - side) / 2;
+    int y0 = (h - side) / 2;
+    for (int ty = 0; ty < size; ty++)
+    {
+        int sy = y0 + (ty * side + side / 2) / size;       // row from the top
+        int fileRow = topDown ? sy : (h - 1 - sy);
+        if (fseek(f, dataOff + (long)fileRow * rowBytes, SEEK_SET) != 0 ||
+            fread(row, 1, rowBytes, f) != rowBytes)
+            return false;
+        for (int tx = 0; tx < size; tx++)
+        {
+            int sx = x0 + (tx * side + side / 2) / size;
+            const u8 *px = row + sx * (bpp / 8);
+            out[ty * size + tx] = UIC(px[2] >> 3, px[1] >> 3, px[0] >> 3);
+        }
+    }
+    return true;
+}
+
+bool uiLoadTheme(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return false;
+
+    u8 hdr[54];
+    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && hdr[0] == 'B' && hdr[1] == 'M';
+    u32 dataOff = ok ? le32(hdr + 10) : 0;
+    int w = ok ? (int)le32(hdr + 18) : 0;
+    int h = ok ? (int)le32(hdr + 22) : 0;
+    int bpp = ok ? (hdr[28] | (hdr[29] << 8)) : 0;
+    u32 comp = ok ? le32(hdr + 30) : 1;
+    bool topDown = h < 0;
+    if (topDown)
+        h = -h;
+
+    // 24-bit, or 32-bit (BI_RGB or BI_BITFIELDS with the usual BGRA layout)
+    ok = ok && w > 0 && h > 0 && w <= 8192 && h <= 8192 &&
+         ((bpp == 24 && comp == 0) || (bpp == 32 && (comp == 0 || comp == 3)));
+    if (!ok)
+    {
+        fclose(f);
+        return false;
+    }
+
+    u32 rowBytes = ((u32)w * (bpp / 8) + 3) & ~3u;
+    u8 *row = malloc(rowBytes);
+    u16 *tile = malloc(TILE_SIZE * TILE_SIZE * 2);
+    ok = row && tile &&
+         sampleSquare(f, dataOff, w, h, topDown, bpp, row, rowBytes, icon, ICON_SIZE) &&
+         sampleSquare(f, dataOff, w, h, topDown, bpp, row, rowBytes, tile, TILE_SIZE);
+    fclose(f);
+
+    if (ok)
+    {
+        // Rebuild the background: gradient with the picture tiled over it at ~22%
+        for (int y = 0; y < UI_H; y++)
+        {
+            u16 base = mix(4, 5, 11, 1, 1, 3, y, UI_H);
+            int br = base & 31, bg = (base >> 5) & 31, bb = (base >> 10) & 31;
+            for (int x = 0; x < UI_W; x++)
+            {
+                u16 t = tile[(y % TILE_SIZE) * TILE_SIZE + (x % TILE_SIZE)];
+                int r = (br * 78 + (t & 31) * 22) / 100;
+                int g = (bg * 78 + ((t >> 5) & 31) * 22) / 100;
+                int b = (bb * 78 + ((t >> 10) & 31) * 22) / 100;
+                background[y * UI_W + x] = UIC(r, g, b);
+            }
+        }
+        haveTheme = true;
+    }
+
+    free(row);
+    free(tile);
+    return ok;
 }
