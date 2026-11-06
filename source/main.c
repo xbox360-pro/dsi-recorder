@@ -24,6 +24,7 @@
 
 #include "avi.h"
 #include "player.h"
+#include "ui.h"
 
 #define CAMERA_NDMA_CHANNEL 1
 
@@ -47,27 +48,10 @@
 // FPS slider, stored in tenths of a frame per second: 1 (0.1 fps) .. 600 (60.0 fps).
 #define FPS_MIN_T     1
 #define FPS_MAX_T     600
-#define SLIDER_CELLS  16
-#define SLIDER_ROW    3     // console row of the slider
-#define SLIDER_COL    9     // first cell column (after "FPS:    [")
 static int fpsT = 150;                                // 15.0 fps default
 
 static int fpsStepUp(int t)   { return t < 10 ? t + 1 : (t < FPS_MAX_T ? ((t / 10) + 1) * 10 : t); }
 static int fpsStepDown(int t) { return t > 10 ? ((t - 1) / 10) * 10 : (t > FPS_MIN_T ? t - 1 : t); }
-
-// Slider cell <-> fps (cell 0 = 0.1 fps, last cell = 60 fps, linear in between)
-static int fpsFromCell(int cell)
-{
-    if (cell <= 0)
-        return FPS_MIN_T;
-    int t = (cell * FPS_MAX_T + (SLIDER_CELLS - 1) / 2) / (SLIDER_CELLS - 1);
-    return ((t + 5) / 10) * 10;   // whole fps when tapping
-}
-
-static int cellFromFps(int t)
-{
-    return (t * (SLIDER_CELLS - 1) + FPS_MAX_T / 2) / FPS_MAX_T;
-}
 
 // ---------------------------------------------------------------------------
 // Camera frame ring (filled by NDMA, managed from the VBlank IRQ)
@@ -380,6 +364,38 @@ static void recordTick(void)
 }
 
 // ---------------------------------------------------------------------------
+// Bottom-screen UI
+
+#define SLIDER_X   24
+#define SLIDER_W   208
+#define SLIDER_Y   104
+
+static const UiBox btnCamera = { 8, 120, 76, 24 };
+static const UiBox btnMic = { 90, 120, 76, 24 };
+static const UiBox btnVideos = { 172, 120, 76, 24 };
+static const UiBox btnRec = { 8, 148, 240, 32 };
+static const UiBox sliderZone = { 0, 84, 256, 34 };
+
+enum { PRESS_NONE, PRESS_CAMERA, PRESS_MIC, PRESS_VIDEOS, PRESS_REC };
+static int pressed = PRESS_NONE;
+
+// Slider position (0..1000) <-> fps in tenths (1 = 0.1 fps .. 600 = 60 fps)
+static int fpsToPos(int t)
+{
+    return (t - FPS_MIN_T) * 1000 / (FPS_MAX_T - FPS_MIN_T);
+}
+
+static int fpsFromPos(int pos)
+{
+    if (pos < 0)
+        pos = 0;
+    if (pos > 1000)
+        pos = 1000;
+    int t = FPS_MIN_T + pos * (FPS_MAX_T - FPS_MIN_T) / 1000;
+    if (t >= 10)
+        t = ((t + 5) / 10) * 10;   // whole fps above 1 fps
+    return t;
+}
 
 static void waitForStart(void)
 {
@@ -392,59 +408,116 @@ static void waitForStart(void)
     }
 }
 
+// Full-screen message (errors at startup)
+static void showMessage(const char *title, const char *l1, const char *l2, const char *l3)
+{
+    uiBegin();
+    uiHeader("DSi Recorder");
+    uiCard(8, 40, 240, 96, COL_CARD, COL_CARD_EDGE);
+    uiText(3, 7, TXT_AMBER, "%s", title);
+    if (l1)
+        uiText(3, 9, TXT_WHITE, "%s", l1);
+    if (l2)
+        uiText(3, 10, TXT_WHITE, "%s", l2);
+    if (l3)
+        uiText(3, 12, TXT_MUTED, "%s", l3);
+    uiPresent();
+}
+
 static void drawUi(int camera)
 {
-    printf("\x1b[0;0H");
-    printf("        DSi Recorder\n");
-    printf("--------------------------------\n");
-    printf("Camera: %-6s   Audio: %-3s    \n", camera == CAMERA_INNER ? "inner" : "outer",
-           useAudio ? "on" : "off");
-    {
-        char bar[SLIDER_CELLS + 1];
-        int pos = cellFromFps(fpsT);
-        for (int i = 0; i < SLIDER_CELLS; i++)
-            bar[i] = (i <= pos) ? '=' : '-';
-        bar[pos] = recording ? '|' : 'O';
-        bar[SLIDER_CELLS] = '\0';
-        printf("FPS:    [%s]%2d.%d \n", bar, fpsT / 10, fpsT % 10);
-    }
-    printf("--------------------------------\n");
+    uiBegin();
+    uiHeader("DSi Recorder");
 
+    // Header right side: blinking REC badge or the camera name
     if (recording)
     {
-        u32 secs = (u32)(((u64)avi.videoFrames * 10) / recFpsT);
-        u32 dropped = avi.videoFrames - avi.realFrames;
-        printf("\x1b[31m** REC **\x1b[39m  %02lu:%02lu            \n",
-               (unsigned long)(secs / 60), (unsigned long)(secs % 60));
-        printf("File: %-26s\n", recPath + sizeof(REC_DIR));
-        printf("Size: %lu KB                 \n", (unsigned long)(avi.fileSize / 1024));
-        printf("Frames: %lu (repeated %lu)     \n", (unsigned long)avi.videoFrames,
-               (unsigned long)dropped);
-        printf("Audio drops: %lu               \n", (unsigned long)audioOverflows);
+        bool on = ((vblankCount / 30) & 1) == 0;
+        uiRound(186, 4, 62, 14, 7, on ? COL_RED : COL_RED_DARK);
+        uiCircle(197, 11, 3, COL_WHITE);
+        uiText(26, 1, TXT_WHITE, "REC");
     }
     else
     {
-        printf("Ready.                          \n");
-        printf("                                \n");
-        printf("                                \n");
-        printf("                                \n");
-        printf("                                \n");
+        uiText(22, 1, TXT_MUTED, "%s cam",
+               camera == CAMERA_INNER ? "Inner" : "Outer");
     }
-    printf("%-32s", statusMsg);
 
-    printf("\x1b[15;0H");
-    printf("--------------------------------\n");
-    printf("A       Start / stop recording\n");
-    printf("L / R   Switch camera\n");
-    printf("X       Toggle audio\n");
-    printf("UP/DOWN FPS slider (or touch)\n");
-    printf("SELECT  Watch videos\n");
-    printf("START   Quit\n");
-    printf("Saves to sd:/DSiRecorder/\n");
+    // Info card
+    uiCard(8, 32, 240, 48, COL_CARD, COL_CARD_EDGE);
+    if (recording)
+    {
+        u32 secs = (u32)(((u64)avi.videoFrames * 10) / recFpsT);
+        u32 kb = avi.fileSize / 1024;
+        uiCircle(23, 44, 4, COL_RED);
+        uiText(4, 5, TXT_RED, "Recording");
+        uiText(23, 5, TXT_WHITE, "%02lu:%02lu", (unsigned long)(secs / 60),
+               (unsigned long)(secs % 60));
+        uiText(2, 6, TXT_MUTED, "File");
+        uiText(10, 6, TXT_WHITE, "%s", recPath + sizeof(REC_DIR));
+        uiText(2, 7, TXT_MUTED, "Size");
+        if (kb >= 1024)
+            uiText(10, 7, TXT_WHITE, "%lu.%lu MB", (unsigned long)(kb / 1024),
+                   (unsigned long)((kb % 1024) * 10 / 1024));
+        else
+            uiText(10, 7, TXT_WHITE, "%lu KB", (unsigned long)kb);
+        uiText(2, 8, TXT_MUTED, "Frames");
+        uiText(10, 8, TXT_WHITE, "%lu", (unsigned long)avi.videoFrames);
+        uiText(18, 8, TXT_MUTED, "rep %lu", (unsigned long)(avi.videoFrames - avi.realFrames));
+    }
+    else
+    {
+        uiText(2, 5, TXT_MUTED, "Camera");
+        uiText(13, 5, TXT_WHITE, "%s", camera == CAMERA_INNER ? "Inner (selfie)" : "Outer");
+        uiText(2, 6, TXT_MUTED, "Microphone");
+        uiText(13, 6, useAudio ? TXT_GREEN : TXT_MUTED, "%s", useAudio ? "On" : "Off");
+        uiText(2, 7, TXT_MUTED, "Saves to");
+        uiText(13, 7, TXT_WHITE, "sd:/DSiRecorder");
+        if (statusMsg[0])
+            uiText(2, 8, TXT_AMBER, "%.28s", statusMsg);
+        else
+            uiText(2, 8, TXT_ACCENT, "Ready to record");
+    }
+
+    // Frame-rate slider
+    uiText(2, 11, TXT_MUTED, "Frame rate");
+    uiText(fpsT >= 100 ? 21 : 22, 11, TXT_WHITE, "%d.%d fps", fpsT / 10, fpsT % 10);
+    uiSlider(SLIDER_X, SLIDER_Y, SLIDER_W, fpsToPos(fpsT), !recording,
+             recording ? COL_DISABLED : COL_ACCENT);
+
+    // Buttons
+    uiButton(btnCamera, "Camera", pressed == PRESS_CAMERA ? 1 : 0);
+    uiButton(btnMic, useAudio ? "Mic: On" : "Mic: Off",
+             recording ? 2 : (pressed == PRESS_MIC ? 1 : 0));
+    uiButton(btnVideos, "Videos", recording ? 2 : (pressed == PRESS_VIDEOS ? 1 : 0));
+
+    // Big record / stop button
+    bool down = pressed == PRESS_REC;
+    if (recording)
+    {
+        uiCard(btnRec.x, btnRec.y, btnRec.w, btnRec.h, down ? COL_RED_DARK : UIC(10, 3, 5),
+               COL_RED_EDGE);
+        uiRect(100, 158, 12, 12, COL_WHITE);
+        uiText(15, 20, TXT_WHITE, "STOP");
+    }
+    else
+    {
+        uiCard(btnRec.x, btnRec.y, btnRec.w, btnRec.h, down ? COL_RED_DARK : COL_RED,
+               COL_RED_EDGE);
+        uiRound(btnRec.x + 6, btnRec.y + 2, btnRec.w - 12, 3, 1, UIC(31, 12, 14));
+        uiCircle(98, 164, 6, COL_WHITE);
+        uiText(14, 20, TXT_WHITE, "RECORD");
+    }
+
+    uiText(1, 23, TXT_MUTED, "A rec  L/R cam  SELECT videos");
+    uiPresent();
 }
 
 int main(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     // Top screen: 16-bit bitmap for the camera preview
     videoSetMode(MODE_5_2D);
     vramSetBankA(VRAM_A_MAIN_BG);
@@ -452,20 +525,21 @@ int main(int argc, char **argv)
     previewVram = bgGetGfxPtr(bg);
     memset(previewVram, 0, 256 * 256 * 2);
 
-    // Bottom screen: text console
-    consoleDemoInit();
+    // Bottom screen: themed UI (bitmap + text)
+    uiInit();
 
     if (!isDSiMode())
     {
-        printf("DSi Recorder\n\nThis app needs DSi mode\n(DSi/3DS console, launched from\nthe SD card).\n\nPress START to exit.");
+        showMessage("This app needs DSi mode", "Run it on a DSi or 3DS,",
+                    "launched from the SD card.", "Press START to exit");
         waitForStart();
         return 0;
     }
 
-    printf("Mounting SD card...\n");
+    showMessage("Starting up...", "Mounting SD card", NULL, NULL);
     if (!fatInitDefault())
     {
-        printf("SD card init failed!\n\nPress START to exit.");
+        showMessage("SD card error", "Couldn't open the SD card.", NULL, "Press START to exit");
         waitForStart();
         return 0;
     }
@@ -487,10 +561,10 @@ int main(int argc, char **argv)
     DC_FlushRange(micBuffer, sizeof(micBuffer));
     soundEnable();
 
-    printf("Starting camera...\n");
+    showMessage("Starting up...", "Starting camera", NULL, NULL);
     if (!cameraInit())
     {
-        printf("Camera init failed!\n\nPress START to exit.");
+        showMessage("Camera error", "The camera didn't start.", NULL, "Press START to exit");
         waitForStart();
         return 0;
     }
@@ -498,7 +572,7 @@ int main(int argc, char **argv)
     int camera = CAMERA_OUTER;
     if (!cameraSelect(camera) || !cameraResume())
     {
-        printf("Camera select failed!\n\nPress START to exit.");
+        showMessage("Camera error", "Couldn't select the camera.", NULL, "Press START to exit");
         waitForStart();
         cameraDeinit();
         return 0;
@@ -508,19 +582,48 @@ int main(int argc, char **argv)
     irqSet(IRQ_VBLANK, vblankHandler);
     irqEnable(IRQ_VBLANK);
 
-    consoleClear();
-
     int uiTimer = 0;
+    bool dragging = false;
     while (1)
     {
         swiWaitForVBlank();
         scanKeys();
-        u16 down = keysDown();
+        u32 down = keysDown();
+        u32 held = keysHeld();
+        u32 up = keysUp();
+
+        touchPosition tp = { 0 };
+        if (held & KEY_TOUCH)
+            touchRead(&tp);
 
         if (down & KEY_START)
             break;
 
-        if (down & KEY_A)
+        // Touch: find what was pressed, act on release (like a real button)
+        int action = PRESS_NONE;
+        if (down & KEY_TOUCH)
+        {
+            if (uiHit(btnRec, tp.px, tp.py))
+                pressed = PRESS_REC;
+            else if (uiHit(btnCamera, tp.px, tp.py))
+                pressed = PRESS_CAMERA;
+            else if (uiHit(btnMic, tp.px, tp.py) && !recording)
+                pressed = PRESS_MIC;
+            else if (uiHit(btnVideos, tp.px, tp.py) && !recording)
+                pressed = PRESS_VIDEOS;
+            else if (uiHit(sliderZone, tp.px, tp.py) && !recording)
+                dragging = true;
+            uiTimer = 0;
+        }
+        if (up & KEY_TOUCH)
+        {
+            action = pressed;
+            pressed = PRESS_NONE;
+            dragging = false;
+            uiTimer = 0;
+        }
+
+        if ((down & KEY_A) || action == PRESS_REC)
         {
             if (recording)
                 stopRecording(NULL);
@@ -529,61 +632,53 @@ int main(int argc, char **argv)
             uiTimer = 0;
         }
 
-        if (down & (KEY_L | KEY_R))
+        if ((down & (KEY_L | KEY_R)) || action == PRESS_CAMERA)
         {
-            int want = (down & KEY_L) ? CAMERA_INNER : CAMERA_OUTER;
-            if (want == camera)
-                want = (camera == CAMERA_INNER) ? CAMERA_OUTER : CAMERA_INNER;
-            cameraPause();
-            if (cameraSelect(want))
-                camera = want;
-            else
-                cameraSelect(camera);
-            if (!cameraResume())
-                snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
+            int want = (camera == CAMERA_INNER) ? CAMERA_OUTER : CAMERA_INNER;
+            if (down & KEY_L)
+                want = CAMERA_INNER;
+            if (down & KEY_R)
+                want = CAMERA_OUTER;
+            if (want != camera)
+            {
+                cameraPause();
+                if (cameraSelect(want))
+                    camera = want;
+                else
+                    cameraSelect(camera);
+                if (!cameraResume())
+                    snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
+            }
             uiTimer = 0;
         }
 
-        if ((down & KEY_SELECT) && !recording)
+        if (((down & KEY_SELECT) || action == PRESS_VIDEOS) && !recording)
         {
             cameraPause();
             runViewer(previewVram);
             if (!cameraResume())
                 snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
-            consoleClear();
             uiTimer = 0;
             continue;
         }
 
         if (!recording)
         {
-            if (down & KEY_X)
+            if ((down & KEY_X) || action == PRESS_MIC)
+            {
                 useAudio = !useAudio;
+                uiTimer = 0;
+            }
+
             int oldFps = fpsT;
-            u16 rep = keysDownRepeat();   // hold Up/Down to scroll
+            u32 rep = keysDownRepeat();   // hold Up/Down to scroll
             if (rep & KEY_UP)
                 fpsT = fpsStepUp(fpsT);
             if (rep & KEY_DOWN)
                 fpsT = fpsStepDown(fpsT);
-
-            // Tap or drag on the slider row
-            if (keysHeld() & KEY_TOUCH)
-            {
-                touchPosition tp;
-                touchRead(&tp);
-                int row = tp.py / 8;
-                if (row >= SLIDER_ROW - 1 && row <= SLIDER_ROW + 1)
-                {
-                    int cell = tp.px / 8 - SLIDER_COL;
-                    if (cell < 0)
-                        cell = 0;
-                    if (cell > SLIDER_CELLS - 1)
-                        cell = SLIDER_CELLS - 1;
-                    fpsT = fpsFromCell(cell);
-                }
-            }
-
-            if ((down & KEY_X) || fpsT != oldFps)
+            if (dragging && (held & KEY_TOUCH))
+                fpsT = fpsFromPos((tp.px - SLIDER_X) * 1000 / SLIDER_W);
+            if (fpsT != oldFps)
                 uiTimer = 0;
         }
 
@@ -604,7 +699,7 @@ int main(int argc, char **argv)
     return 0;
 
 oom:
-    printf("Out of memory!\n\nPress START to exit.");
+    showMessage("Out of memory", "Not enough RAM to run.", NULL, "Press START to exit");
     waitForStart();
     return 0;
 }
