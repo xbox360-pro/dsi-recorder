@@ -8,6 +8,7 @@
 //   L / R      switch inner / outer camera
 //   X          toggle microphone audio (when not recording)
 //   UP / DOWN  FPS slider 0.1 - 60 fps (hold to scroll, or tap/drag on touch screen)
+//   LEFT/RIGHT digital zoom 1x - 4x (also while recording; tap the zoom chip to jump)
 //   SELECT     video viewer (play back recordings)
 //   START      quit
 //
@@ -208,10 +209,60 @@ static u32 recFpsT;                // fps * 10 for the current recording
 static char recPath[64];
 static char statusMsg[33] = "";
 
+// Digital zoom, 8.8 fixed point: 256 = 1x .. 1024 = 4x. Applies to preview and recording.
+#define ZOOM_MIN   256
+#define ZOOM_MAX   1024
+#define ZOOM_STEP  64
+static volatile int zoomQ8 = ZOOM_MIN;
+
+// Zoom the top-screen preview with the hardware (BG3 affine registers): no CPU cost.
+static void applyPreviewZoom(int z)
+{
+    int step = (256 * 256) / z;                    // source pixels per screen pixel (8.8)
+    int x0 = (FRAME_W - (FRAME_W * 256) / z) / 2;  // crop origin, centred
+    int y0 = (FRAME_H - (FRAME_H * 256) / z) / 2;
+    REG_BG3PA = step;
+    REG_BG3PB = 0;
+    REG_BG3PC = 0;
+    REG_BG3PD = step;
+    REG_BG3X = x0 << 8;
+    REG_BG3Y = y0 << 8;
+}
+
+// Zoomed version: crops the centre and scales it up (nearest neighbour), same pixel
+// format and bottom-up order as convertFrame.
+ITCM_CODE
+static void convertFrameZoom(const u16 *src, u8 *dstBytes, int z)
+{
+    static u8 colMap[FRAME_W];
+    int cw = (FRAME_W * 256) / z, ch = (FRAME_H * 256) / z;
+    int x0 = (FRAME_W - cw) / 2, y0 = (FRAME_H - ch) / 2;
+    for (int x = 0; x < FRAME_W; x++)
+        colMap[x] = x0 + (x * cw) / FRAME_W;
+
+    u16 *dst = (u16 *)dstBytes;
+    for (int y = 0; y < FRAME_H; y++)
+    {
+        int fy = FRAME_H - 1 - y;                     // AVI rows are bottom-up
+        const u16 *s = src + (y0 + (fy * ch) / FRAME_H) * FRAME_W;
+        for (int x = 0; x < FRAME_W; x++)
+        {
+            u32 v = s[colMap[x]];
+            *dst++ = ((v & 0x1F) << 10) | (v & 0x3E0) | ((v >> 10) & 0x1F);
+        }
+    }
+}
+
 // DS RGB15 (R low bits) -> AVI RGB555 (B low bits), flipped to bottom-up.
 ITCM_CODE
 static void convertFrame(const u16 *src, u8 *dstBytes)
 {
+    int z = zoomQ8;
+    if (z != ZOOM_MIN)
+    {
+        convertFrameZoom(src, dstBytes, z);
+        return;
+    }
     u32 *dst = (u32 *)dstBytes;  // dstBytes is 4-byte aligned (see batch layout)
     for (int y = 0; y < FRAME_H; y++)
     {
@@ -403,8 +454,9 @@ static const UiBox btnMic = { 90, 120, 76, 24 };
 static const UiBox btnVideos = { 172, 120, 76, 24 };
 static const UiBox btnRec = { 8, 148, 240, 32 };
 static const UiBox sliderZone = { 0, 84, 256, 34 };
+static const UiBox btnZoom = { 192, 36, 52, 16 };
 
-enum { PRESS_NONE, PRESS_CAMERA, PRESS_MIC, PRESS_VIDEOS, PRESS_REC };
+enum { PRESS_NONE, PRESS_CAMERA, PRESS_MIC, PRESS_VIDEOS, PRESS_REC, PRESS_ZOOM };
 static int pressed = PRESS_NONE;
 
 // Slider position (0..1000) <-> fps in tenths (1 = 0.1 fps .. 600 = 60 fps)
@@ -479,7 +531,7 @@ static void drawUi(int camera)
         u32 kb = avi.fileSize / 1024;
         uiCircle(23, 44, 4, COL_RED);
         uiText(4, 5, TXT_RED, "Recording");
-        uiText(23, 5, TXT_WHITE, "%02lu:%02lu", (unsigned long)(secs / 60),
+        uiText(15, 5, TXT_WHITE, "%02lu:%02lu", (unsigned long)(secs / 60),
                (unsigned long)(secs % 60));
         uiText(2, 6, TXT_MUTED, "File");
         uiText(10, 6, TXT_WHITE, "%s", recPath + sizeof(REC_DIR));
@@ -496,7 +548,7 @@ static void drawUi(int camera)
     else
     {
         uiText(2, 5, TXT_MUTED, "Camera");
-        uiText(13, 5, TXT_WHITE, "%s", camera == CAMERA_INNER ? "Inner (selfie)" : "Outer");
+        uiText(13, 5, TXT_WHITE, "%s", camera == CAMERA_INNER ? "Inner" : "Outer");
         uiText(2, 6, TXT_MUTED, "Microphone");
         uiText(13, 6, useAudio ? TXT_GREEN : TXT_MUTED, "%s", useAudio ? "On" : "Off");
         uiText(2, 7, TXT_MUTED, "Saves to");
@@ -538,7 +590,20 @@ static void drawUi(int camera)
         uiText(14, 20, TXT_WHITE, "RECORD");
     }
 
-    uiText(1, 23, TXT_MUTED, "A rec  L/R cam  SELECT videos");
+    // Zoom chip (top-right of the info card): tap to jump 1x/2x/3x/4x
+    {
+        char z[8];
+        int zt = zoomQ8 * 10 / 256;                   // zoom in tenths
+        snprintf(z, sizeof(z), "%d.%dx", zt / 10, zt % 10);
+        bool on = zoomQ8 != ZOOM_MIN;
+        u16 edge = pressed == PRESS_ZOOM ? COL_WHITE : COL_ACCENT;
+        uiRound(btnZoom.x, btnZoom.y, btnZoom.w, btnZoom.h, 8, edge);
+        uiRound(btnZoom.x + 1, btnZoom.y + 1, btnZoom.w - 2, btnZoom.h - 2, 7,
+                on ? UIC(6, 16, 24) : COL_BUTTON);
+        uiTextCenter(btnZoom.x + btnZoom.w / 2, 5, TXT_WHITE, z);
+    }
+
+    uiText(1, 23, TXT_MUTED, "A rec L/R cam  Left/Right zoom");
     uiPresent();
 }
 
@@ -552,6 +617,7 @@ int main(int argc, char **argv)
     vramSetBankA(VRAM_A_MAIN_BG);
     int bg = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
     previewVram = bgGetGfxPtr(bg);
+    applyPreviewZoom(ZOOM_MIN);
     memset(previewVram, 0, 256 * 256 * 2);
 
     // Bottom screen: themed UI (bitmap + text)
@@ -623,6 +689,7 @@ int main(int argc, char **argv)
         u32 down = keysDown();
         u32 held = keysHeld();
         u32 up = keysUp();
+        u32 rep = keysDownRepeat();   // read once per frame: the call clears its state
 
         touchPosition tp = { 0 };
         if (held & KEY_TOUCH)
@@ -637,6 +704,8 @@ int main(int argc, char **argv)
         {
             if (uiHit(btnRec, tp.px, tp.py))
                 pressed = PRESS_REC;
+            else if (uiHit(btnZoom, tp.px, tp.py))
+                pressed = PRESS_ZOOM;
             else if (uiHit(btnCamera, tp.px, tp.py))
                 pressed = PRESS_CAMERA;
             else if (uiHit(btnMic, tp.px, tp.py) && !recording)
@@ -684,10 +753,30 @@ int main(int argc, char **argv)
             uiTimer = 0;
         }
 
+        // Zoom: Left/Right in 0.25x steps (hold to repeat), chip jumps 1x/2x/3x/4x.
+        // Works while recording too.
+        {
+            int z = zoomQ8;
+            if ((rep & KEY_RIGHT) && z < ZOOM_MAX)
+                z += ZOOM_STEP;
+            if ((rep & KEY_LEFT) && z > ZOOM_MIN)
+                z -= ZOOM_STEP;
+            if (action == PRESS_ZOOM)
+                z = z >= ZOOM_MAX ? ZOOM_MIN : ((z / 256) + 1) * 256;
+            if (z != zoomQ8)
+            {
+                zoomQ8 = z;
+                applyPreviewZoom(z);
+                uiTimer = 0;
+            }
+        }
+
         if (((down & KEY_SELECT) || action == PRESS_VIDEOS) && !recording)
         {
             cameraPause();
+            applyPreviewZoom(ZOOM_MIN);               // the viewer uses the screen unzoomed
             runViewer(previewVram);
+            applyPreviewZoom(zoomQ8);
             if (!cameraResume())
                 snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
             uiTimer = 0;
@@ -703,7 +792,6 @@ int main(int argc, char **argv)
             }
 
             int oldFps = fpsT;
-            u32 rep = keysDownRepeat();   // hold Up/Down to scroll
             if (rep & KEY_UP)
                 fpsT = fpsStepUp(fpsT);
             if (rep & KEY_DOWN)
