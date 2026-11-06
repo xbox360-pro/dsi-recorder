@@ -5,7 +5,8 @@
 // the PCM audio into a looping sound channel.
 //
 // Controls (list):    UP/DOWN select, A play, X delete, B back to camera
-// Controls (playing): A pause/resume, R skip +5 s, L restart, B stop
+// Controls (playing): A pause/resume, R skip +5 s, L restart, Y snapshot, B stop
+// L/R in the list switches between the Videos and Photos tabs.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -25,6 +26,7 @@
 extern volatile u32 vblankCount;     // incremented by main.c's VBlank handler
 
 #define REC_DIR      "/DSiRecorder"
+#define PHOTO_DIR    "/DCIM/100DSI00"        // snapshots (standard camera folder layout)
 #define FRAME_W      256
 #define FRAME_H      192
 #define FRAME_BYTES  (FRAME_W * FRAME_H * 2)
@@ -285,9 +287,91 @@ static void fill(void)
     }
 }
 
-static const UiBox pbRestart = { 8, 120, 76, 24 };
-static const UiBox pbSkip = { 90, 120, 76, 24 };
-static const UiBox pbBack = { 172, 120, 76, 24 };
+static const UiBox pbRestart = { 8, 120, 56, 24 };
+static const UiBox pbSkip = { 68, 120, 56, 24 };
+static const UiBox pbPhoto = { 128, 120, 60, 24 };
+static const UiBox pbBack = { 192, 120, 56, 24 };
+
+static char snapMsg[32];
+static u32 snapMsgUntil;
+
+static void put32le(u8 *p, u32 v)
+{
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+static int nextPhotoNumber(void)
+{
+    int highest = 0;
+    DIR *d = opendir(PHOTO_DIR);
+    if (d == NULL)
+        return 1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+    {
+        if (strncasecmp(e->d_name, "IMG_", 4) == 0)
+        {
+            int n = atoi(e->d_name + 4);
+            if (n > highest)
+                highest = n;
+        }
+    }
+    closedir(d);
+    return highest + 1;
+}
+
+// Saves what's on the top screen (the paused frame) as a 24-bit BMP photo.
+static bool saveSnapshot(const u16 *vram, char *nameOut)
+{
+    mkdir("/DCIM", 0777);
+    mkdir(PHOTO_DIR, 0777);
+    char path[64];
+    int n = nextPhotoNumber();
+    snprintf(nameOut, 16, "IMG_%04d.BMP", n);
+    snprintf(path, sizeof(path), PHOTO_DIR "/%s", nameOut);
+
+    const u32 rowBytes = FRAME_W * 3;                 // 768, already a multiple of 4
+    const u32 dataBytes = rowBytes * FRAME_H;
+    u8 hdr[54];
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B';
+    hdr[1] = 'M';
+    put32le(hdr + 2, 54 + dataBytes);
+    put32le(hdr + 10, 54);
+    put32le(hdr + 14, 40);
+    put32le(hdr + 18, FRAME_W);
+    put32le(hdr + 22, FRAME_H);                       // positive = bottom-up rows
+    hdr[26] = 1;
+    hdr[28] = 24;
+    put32le(hdr + 34, dataBytes);
+    put32le(hdr + 38, 2835);                          // 72 dpi
+    put32le(hdr + 42, 2835);
+
+    int fdOut = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fdOut < 0)
+        return false;
+    bool ok = write(fdOut, hdr, 54) == 54;
+
+    u8 *buf = tmp;                                    // reuse the viewer's scratch buffer
+    for (int y = FRAME_H - 1; y >= 0 && ok; y--)
+    {
+        const u16 *s = vram + y * FRAME_W;
+        u8 *d = buf;
+        for (int x = 0; x < FRAME_W; x++)
+        {
+            u16 v = s[x];
+            int r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
+            *d++ = (b << 3) | (b >> 2);
+            *d++ = (g << 3) | (g >> 2);
+            *d++ = (r << 3) | (r >> 2);
+        }
+        ok = write(fdOut, buf, rowBytes) == (ssize_t)rowBytes;
+    }
+    close(fdOut);
+    if (!ok)
+        unlink(path);
+    return ok;
+}
 static const UiBox pbPlay = { 8, 148, 240, 32 };
 
 static bool ended(void)
@@ -310,8 +394,10 @@ static void drawPlayUi(const char *name, int pressedBtn)
     uiText(2, 6, TXT_MUTED, "%lu.%lu fps", (unsigned long)(vidRate * 10 / vidScale / 10),
            (unsigned long)(vidRate * 10 / vidScale % 10));
     uiText(14, 6, hasAudio ? TXT_GREEN : TXT_MUTED, "%s", hasAudio ? "with sound" : "no sound");
-    if (paused)
-        uiText(2, 8, TXT_AMBER, "Paused");
+    if (snapMsg[0] && vblankCount < snapMsgUntil)
+        uiText(2, 8, TXT_GREEN, "%.28s", snapMsg);
+    else if (paused)
+        uiText(2, 8, TXT_AMBER, "Paused  (Y = take photo)");
     else if (ended())
         uiText(2, 8, TXT_ACCENT, "Finished");
     else
@@ -329,8 +415,9 @@ static void drawPlayUi(const char *name, int pressedBtn)
     int pos = total ? (int)((u64)cur * 1000 / total) : (ended() ? 1000 : 0);
     uiSlider(24, 104, 208, pos, true, COL_ACCENT);
 
-    uiButton(pbRestart, "Restart", pressedBtn == 1 ? 1 : 0);
-    uiButton(pbSkip, "+5 sec", ended() ? 2 : (pressedBtn == 2 ? 1 : 0));
+    uiButton(pbRestart, "Start", pressedBtn == 1 ? 1 : 0);
+    uiButton(pbSkip, "+5s", ended() ? 2 : (pressedBtn == 2 ? 1 : 0));
+    uiButton(pbPhoto, "Photo", pressedBtn == 5 ? 1 : 0);
     uiButton(pbBack, "Back", pressedBtn == 3 ? 1 : 0);
 
     // Big play / pause button
@@ -348,7 +435,7 @@ static void drawPlayUi(const char *name, int pressedBtn)
         uiText(14, 20, TXT_WHITE, "PAUSE");
     }
 
-    uiText(1, 23, TXT_MUTED, "A play/pause  R +5s  L restart");
+    uiText(1, 23, TXT_MUTED, "A pause  Y photo  R +5s  L top");
     uiPresent();
 }
 
@@ -377,6 +464,7 @@ static void playFile(const char *name, u16 *vram)
     }
 
     memset(vram, 0, 256 * 192 * 2);
+    snapMsg[0] = 0;
     resetAudio(0);
 
     // Prefill before starting the clock
@@ -407,6 +495,7 @@ static void playFile(const char *name, u16 *vram)
                        : uiHit(pbSkip, tp.px, tp.py)    ? 2
                        : uiHit(pbBack, tp.px, tp.py)    ? 3
                        : uiHit(pbPlay, tp.px, tp.py)    ? 4
+                       : uiHit(pbPhoto, tp.px, tp.py)   ? 5
                                                         : 0;
             uiTimer = 0;
         }
@@ -424,6 +513,8 @@ static void playFile(const char *name, u16 *vram)
             down |= KEY_B;
         if (action == 4)
             down |= KEY_A;
+        if (action == 5)
+            down |= KEY_Y;
 
         u32 now = vblankCount;
         if (!paused)
@@ -432,6 +523,24 @@ static void playFile(const char *name, u16 *vram)
 
         if (down & KEY_B)
             break;
+
+        // Snapshot: pause on the frame and save it as a photo
+        if (down & KEY_Y)
+        {
+            if (!paused && !ended())
+            {
+                paused = true;
+                if (sndId >= 0)
+                    soundPause(sndId);
+            }
+            char shot[16];
+            if (saveSnapshot(vram, shot))
+                snprintf(snapMsg, sizeof(snapMsg), "Saved photo %s", shot);
+            else
+                snprintf(snapMsg, sizeof(snapMsg), "Couldn't save photo!");
+            snapMsgUntil = vblankCount + 180;           // show for ~3 s
+            uiTimer = 0;
+        }
 
         if (down & KEY_A)
         {
@@ -528,17 +637,25 @@ static int cmpNames(const void *a, const void *b)
     return strcasecmp((const char *)b, (const char *)a);   // newest (highest number) first
 }
 
+static int tab;                       // 0 = videos, 1 = photos
+
+static const char *tabDir(void)
+{
+    return tab ? PHOTO_DIR : REC_DIR;
+}
+
 static void scanFiles(void)
 {
     numFiles = 0;
-    DIR *d = opendir(REC_DIR);
+    const char *ext = tab ? ".BMP" : ".AVI";
+    DIR *d = opendir(tabDir());
     if (d == NULL)
         return;
     struct dirent *e;
     while ((e = readdir(d)) != NULL && numFiles < MAX_FILES)
     {
         size_t len = strlen(e->d_name);
-        if (len < 5 || len >= 32 || strcasecmp(e->d_name + len - 4, ".AVI") != 0)
+        if (len < 5 || len >= 32 || strcasecmp(e->d_name + len - 4, ext) != 0)
             continue;
         strcpy(names[numFiles], e->d_name);
         numFiles++;
@@ -550,7 +667,7 @@ static void scanFiles(void)
     {
         char path[64];
         struct stat st;
-        snprintf(path, sizeof(path), REC_DIR "/%s", names[i]);
+        snprintf(path, sizeof(path), "%s/%s", tabDir(), names[i]);
         sizesKb[i] = stat(path, &st) == 0 ? (u32)(st.st_size / 1024) : 0;
     }
 }
@@ -565,21 +682,37 @@ static const UiBox lbDown = { 104, 160, 44, 24 };
 static const UiBox lbDelete = { 152, 160, 44, 24 };
 static const UiBox lbPlay = { 200, 160, 48, 24 };
 
+static const UiBox tabVideos = { 136, 4, 54, 15 };
+static const UiBox tabPhotos = { 192, 4, 56, 15 };
+
 static const UiBox dlgCancel = { 32, 120, 88, 24 };
 static const UiBox dlgDelete = { 136, 120, 88, 24 };
 
 static void drawList(int sel, int top, int pressedBtn)
 {
     uiBegin();
-    uiHeader("Videos");
-    uiText(numFiles == 1 ? 24 : 23, 1, TXT_MUTED, "%d %s", numFiles, numFiles == 1 ? "file" : "files");
+    uiHeader("Gallery");
+
+    // Tabs (tap, or press L/R)
+    uiRound(tabVideos.x, tabVideos.y, tabVideos.w, tabVideos.h, 7, tab == 0 ? COL_ACCENT : COL_BUTTON);
+    uiRound(tabPhotos.x, tabPhotos.y, tabPhotos.w, tabPhotos.h, 7, tab == 1 ? COL_ACCENT : COL_BUTTON);
+    uiText(18, 1, tab == 0 ? TXT_DARK : TXT_MUTED, "Videos");
+    uiText(25, 1, tab == 1 ? TXT_DARK : TXT_MUTED, "Photos");
 
     if (numFiles == 0)
     {
         uiCard(8, 40, 240, 80, COL_CARD, COL_CARD_EDGE);
-        uiText(3, 8, TXT_WHITE, "No videos yet");
-        uiText(3, 10, TXT_MUTED, "Record something first, then");
-        uiText(3, 11, TXT_MUTED, "it will show up here.");
+        uiText(3, 8, TXT_WHITE, tab ? "No photos yet" : "No videos yet");
+        if (tab)
+        {
+            uiText(3, 10, TXT_MUTED, "Pause a video and press Y");
+            uiText(3, 11, TXT_MUTED, "(or Photo) to save a frame.");
+        }
+        else
+        {
+            uiText(3, 10, TXT_MUTED, "Record something first, then");
+            uiText(3, 11, TXT_MUTED, "it will show up here.");
+        }
     }
 
     for (int r = 0; r < ITEMS; r++)
@@ -618,7 +751,9 @@ static void drawList(int sel, int top, int pressedBtn)
     uiButton(lbUp, "Up", !any || sel == 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
     uiButton(lbDown, "Down", !any || sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
     uiButton(lbDelete, "Del", !any ? 2 : (pressedBtn == 5 ? 1 : 0));
-    uiButton(lbPlay, "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    uiButton(lbPlay, tab ? "View" : "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    uiText(1, 23, TXT_MUTED, "%d %s   L/R switch tab", numFiles,
+           tab ? (numFiles == 1 ? "photo" : "photos") : (numFiles == 1 ? "video" : "videos"));
     uiPresent();
 }
 
@@ -626,12 +761,12 @@ static void drawList(int sel, int top, int pressedBtn)
 static void drawConfirm(const char *name, int pressedBtn)
 {
     uiBegin();
-    uiHeader("Videos");
+    uiHeader("Gallery");
     uiCard(16, 40, 224, 112, COL_CARD, COL_RED_EDGE);
     uiCircle(36, 60, 7, COL_RED);
     uiRect(35, 55, 2, 6, COL_WHITE);
     uiRect(35, 63, 2, 2, COL_WHITE);
-    uiText(6, 7, TXT_WHITE, "Delete this video?");
+    uiText(6, 7, TXT_WHITE, tab ? "Delete this photo?" : "Delete this video?");
     uiText(4, 9, TXT_AMBER, "%.24s", name);
     uiText(4, 11, TXT_MUTED, "This can't be undone.");
 
@@ -676,6 +811,160 @@ static bool confirmDelete(const char *name)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Photo viewer
+
+static const UiBox phBack = { 8, 148, 56, 32 };
+static const UiBox phPrev = { 68, 148, 56, 32 };
+static const UiBox phNext = { 128, 148, 56, 32 };
+static const UiBox phDel = { 188, 148, 60, 32 };
+
+// Loads a 24/32-bit BMP onto the top screen, scaled to fit (letterboxed).
+static bool showPhoto(const char *name, u16 *vram)
+{
+    char path[64];
+    snprintf(path, sizeof(path), PHOTO_DIR "/%s", name);
+    memset(vram, 0, 256 * 192 * 2);
+
+    int f = open(path, O_RDONLY);
+    if (f < 0)
+        return false;
+    u8 h[54];
+    bool ok = read(f, h, 54) == 54 && h[0] == 'B' && h[1] == 'M';
+    u32 off = ok ? rd32(h + 10) : 0;
+    int w = ok ? (int)rd32(h + 18) : 0;
+    int ht = ok ? (int)rd32(h + 22) : 0;
+    int bpp = ok ? (h[28] | (h[29] << 8)) : 0;
+    bool topDown = ht < 0;
+    if (topDown)
+        ht = -ht;
+    ok = ok && w > 0 && ht > 0 && w <= 4096 && ht <= 4096 && (bpp == 24 || bpp == 32);
+    if (!ok)
+    {
+        close(f);
+        return false;
+    }
+
+    // fit inside 256x192 keeping the aspect ratio
+    int outW = FRAME_W, outH = (ht * FRAME_W) / w;
+    if (outH > FRAME_H)
+    {
+        outH = FRAME_H;
+        outW = (w * FRAME_H) / ht;
+    }
+    int ox = (FRAME_W - outW) / 2, oy = (FRAME_H - outH) / 2;
+    u32 rowBytes = ((u32)w * (bpp / 8) + 3) & ~3u;
+    if (rowBytes > TMP_BYTES)
+    {
+        close(f);
+        return false;
+    }
+
+    for (int y = 0; y < outH && ok; y++)
+    {
+        int sy = (y * ht) / outH;
+        int fileRow = topDown ? sy : (ht - 1 - sy);
+        ok = lseek(f, off + (u32)fileRow * rowBytes, SEEK_SET) >= 0 &&
+             read(f, tmp, rowBytes) == (ssize_t)rowBytes;
+        u16 *d = vram + (oy + y) * FRAME_W + ox;
+        for (int x = 0; x < outW && ok; x++)
+        {
+            const u8 *px = tmp + ((x * w) / outW) * (bpp / 8);
+            d[x] = RGB15(px[2] >> 3, px[1] >> 3, px[0] >> 3) | BIT(15);
+        }
+    }
+    close(f);
+    return ok;
+}
+
+static void drawPhotoUi(int sel, bool ok, int pressedBtn)
+{
+    uiBegin();
+    uiHeader("Photo");
+    uiText(23, 1, TXT_MUTED, "%3d / %-3d", sel + 1, numFiles);
+    uiCard(8, 32, 240, 48, COL_CARD, COL_CARD_EDGE);
+    uiText(2, 5, TXT_WHITE, "%.28s", names[sel]);
+    if (ok)
+        uiText(2, 6, TXT_MUTED, "%lu KB   sd:/DCIM/100DSI00", (unsigned long)sizesKb[sel]);
+    else
+        uiText(2, 6, TXT_AMBER, "Can't show this file");
+    uiText(2, 8, TXT_ACCENT, "Shown on the top screen");
+
+    uiButton(phBack, "Back", pressedBtn == 1 ? 1 : 0);
+    uiButton(phPrev, "Prev", sel <= 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
+    uiButton(phNext, "Next", sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
+    uiButton(phDel, "Del", pressedBtn == 4 ? 1 : 0);
+    uiText(1, 23, TXT_MUTED, "Left/Right browse  X delete");
+    uiPresent();
+}
+
+static bool confirmDelete(const char *name);
+
+// Returns the selection to go back to in the list
+static int viewPhotos(int sel, u16 *vram)
+{
+    int pressedBtn = 0;
+    bool ok = showPhoto(names[sel], vram);
+    drawPhotoUi(sel, ok, 0);
+    while (numFiles > 0)
+    {
+        swiWaitForVBlank();
+        scanKeys();
+        u32 down = keysDown();
+        u32 rep = keysDownRepeat();
+        if (down & KEY_TOUCH)
+        {
+            touchPosition tp;
+            touchRead(&tp);
+            pressedBtn = uiHit(phBack, tp.px, tp.py)   ? 1
+                       : uiHit(phPrev, tp.px, tp.py)   ? 2
+                       : uiHit(phNext, tp.px, tp.py)   ? 3
+                       : uiHit(phDel, tp.px, tp.py)    ? 4
+                                                       : 0;
+            drawPhotoUi(sel, ok, pressedBtn);
+        }
+        if (keysUp() & KEY_TOUCH)
+        {
+            if (pressedBtn == 1) down |= KEY_B;
+            if (pressedBtn == 2) rep |= KEY_LEFT;
+            if (pressedBtn == 3) rep |= KEY_RIGHT;
+            if (pressedBtn == 4) down |= KEY_X;
+            pressedBtn = 0;
+            drawPhotoUi(sel, ok, 0);
+        }
+        if (down & KEY_B)
+            break;
+
+        int old = sel;
+        if ((rep & (KEY_RIGHT | KEY_DOWN)) && sel < numFiles - 1)
+            sel++;
+        if ((rep & (KEY_LEFT | KEY_UP)) && sel > 0)
+            sel--;
+        if (down & KEY_X)
+        {
+            if (confirmDelete(names[sel]))
+            {
+                char path[64];
+                snprintf(path, sizeof(path), PHOTO_DIR "/%s", names[sel]);
+                unlink(path);
+                scanFiles();
+                if (sel >= numFiles)
+                    sel = numFiles > 0 ? numFiles - 1 : 0;
+                if (numFiles == 0)
+                    break;
+            }
+            old = -1;                                   // reload + redraw
+        }
+        if (sel != old)
+        {
+            ok = showPhoto(names[sel], vram);
+            drawPhotoUi(sel, ok, 0);
+        }
+    }
+    memset(vram, 0, 256 * 192 * 2);
+    return sel;
+}
+
 void runViewer(u16 *vram)
 {
     q[0] = NULL;
@@ -695,7 +984,7 @@ void runViewer(u16 *vram)
     if (!ok)
     {
         uiBegin();
-        uiHeader("Videos");
+        uiHeader("Gallery");
         uiText(3, 8, TXT_AMBER, "Not enough memory for viewer");
         uiText(3, 10, TXT_MUTED, "Press B to go back");
         uiPresent();
@@ -709,6 +998,7 @@ void runViewer(u16 *vram)
     }
     else
     {
+        tab = 0;
         scanFiles();
         int sel = 0, top = 0;
         bool redraw = true;
@@ -731,7 +1021,13 @@ void runViewer(u16 *vram)
                            : uiHit(lbPlay, tp.px, tp.py)   ? 4
                            : uiHit(lbDelete, tp.px, tp.py) ? 5
                                                            : 0;
-                if (pressedBtn == 0 && tp.py >= ITEM_Y0 && tp.py < ITEM_Y0 + ITEMS * ITEM_H)
+                if (uiHit(tabVideos, tp.px, tp.py) || uiHit(tabPhotos, tp.px, tp.py))
+                {
+                    int want = uiHit(tabPhotos, tp.px, tp.py) ? 1 : 0;
+                    if (want != tab)
+                        down |= want ? KEY_R : KEY_L;
+                }
+                else if (pressedBtn == 0 && tp.py >= ITEM_Y0 && tp.py < ITEM_Y0 + ITEMS * ITEM_H)
                 {
                     int i = top + (tp.py - ITEM_Y0) / ITEM_H;
                     if (i < numFiles)
@@ -761,12 +1057,19 @@ void runViewer(u16 *vram)
 
             if (down & KEY_B)
                 break;
+            if (((down & KEY_L) && tab == 1) || ((down & KEY_R) && tab == 0))
+            {
+                tab = !tab;
+                scanFiles();
+                sel = top = 0;
+                redraw = true;
+            }
             if ((down & KEY_X) && numFiles > 0)
             {
                 if (confirmDelete(names[sel]))
                 {
                     char path[64];
-                    snprintf(path, sizeof(path), REC_DIR "/%s", names[sel]);
+                    snprintf(path, sizeof(path), "%s/%s", tabDir(), names[sel]);
                     unlink(path);
                     scanFiles();
                     if (sel >= numFiles)
@@ -786,7 +1089,10 @@ void runViewer(u16 *vram)
             }
             if ((down & KEY_A) && numFiles > 0)
             {
-                playFile(names[sel], vram);
+                if (tab)
+                    sel = viewPhotos(sel, vram);
+                else
+                    playFile(names[sel], vram);
                 redraw = true;
             }
 
