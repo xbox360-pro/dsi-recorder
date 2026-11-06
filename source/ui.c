@@ -92,8 +92,12 @@ void uiBegin(void)
 
 void uiPresent(void)
 {
-    DC_FlushRange(canvas, UI_W * UI_H * 2);
-    dmaCopyWords(2, canvas, vram, UI_W * UI_H * 2);
+    // CPU copy (32-bit writes) instead of one long DMA: a 96 KB DMA burst hogs the
+    // bus and can starve the camera's NDMA transfer.
+    const u32 *src = (const u32 *)canvas;
+    u32 *dst = (u32 *)vram;
+    for (int i = 0; i < UI_W * UI_H / 2; i++)
+        dst[i] = src[i];
 }
 
 void uiRect(int x, int y, int w, int h, u16 c)
