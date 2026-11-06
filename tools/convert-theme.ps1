@@ -1,7 +1,7 @@
 # DSi Recorder theme converter
-# Turns any picture (PNG, JPG, GIF, BMP, ...) into theme.bmp for DSi Recorder:
-#  - crops the centre square
-#  - resizes to 256x256 with high-quality smoothing
+# Turns any picture (PNG, JPG, GIF, BMP, WebP, ...) into theme.bmp for DSi Recorder:
+#  - crops the centre to the DSi screen shape (4:3)
+#  - resizes to 256x192 (one DSi screen) with high-quality smoothing
 #  - gives it a gentle colour / contrast boost so it reads well on the DSi screen
 #  - saves a 24-bit BMP and copies it to <SD card>\DSiRecorder\theme.bmp if a card is found
 #
@@ -13,20 +13,61 @@ param(
     [double]$Saturation = 1.20,   # 1.0 = unchanged
     [double]$Contrast   = 1.10,   # 1.0 = unchanged
     [double]$Brightness = 0.00,   # -0.2 .. 0.2
-    [int]$Size = 256
+    [int]$Width = 256,
+    [int]$Height = 192
 )
 
 Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
-$src = [System.Drawing.Image]::FromFile((Resolve-Path -LiteralPath $Path).Path)
+$fullPath = (Resolve-Path -LiteralPath $Path).Path
+
+# Load the picture. GDI+ (System.Drawing) can't read WebP/AVIF/HEIC and reports that
+# as "Out of memory", so fall back to Windows Imaging Component (WPF), which uses the
+# codecs installed in Windows, and hand the result to System.Drawing as a PNG.
+function Load-Picture([string]$file) {
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($file)
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        return [System.Drawing.Image]::FromStream($ms)
+    }
+    catch {
+        Add-Type -AssemblyName PresentationCore, WindowsBase
+        try {
+            $fs = [System.IO.File]::OpenRead($file)
+            $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
+                $fs,
+                [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+                [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+            $frame = $decoder.Frames[0]
+            $fs.Dispose()
+            $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+            $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($frame))
+            $png = New-Object System.IO.MemoryStream
+            $enc.Save($png)
+            $png.Position = 0
+            return [System.Drawing.Image]::FromStream($png)
+        }
+        catch {
+            Write-Host ""
+            Write-Host "Windows can't read this picture's format." -ForegroundColor Red
+            Write-Host "Open it in Paint (or a browser), save it as PNG or JPG, and drag that file on instead." -ForegroundColor Yellow
+            Write-Host "(WebP/HEIC/AVIF need the matching 'Image Extensions' from the Microsoft Store.)" -ForegroundColor Yellow
+            exit 1
+        }
+    }
+}
+
+$src = Load-Picture $fullPath
 
 try {
-    # Centre square crop
-    $side = [Math]::Min($src.Width, $src.Height)
-    $cropX = [int](($src.Width - $side) / 2)
-    $cropY = [int](($src.Height - $side) / 2)
+    # Centre crop to the screen's 4:3 shape
+    $cropW = $src.Width; $cropH = $src.Height
+    if ($src.Width * $Height -gt $src.Height * $Width) { $cropW = [int]($src.Height * $Width / $Height) }
+    else { $cropH = [int]($src.Width * $Height / $Width) }
+    $cropX = [int](($src.Width - $cropW) / 2)
+    $cropY = [int](($src.Height - $cropH) / 2)
 
     # Colour matrix: saturation, then contrast/brightness
     $lr = 0.3086; $lg = 0.6094; $lb = 0.0820
@@ -46,19 +87,19 @@ try {
     $attrs.SetColorMatrix($m)
     $attrs.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)   # no dark edges
 
-    $out = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $out = New-Object System.Drawing.Bitmap($Width, $Height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
     $g = [System.Drawing.Graphics]::FromImage($out)
     $g.Clear([System.Drawing.Color]::Black)          # transparent areas become black
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
     $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-    $dest = New-Object System.Drawing.Rectangle(0, 0, $Size, $Size)
-    $g.DrawImage($src, $dest, $cropX, $cropY, $side, $side, [System.Drawing.GraphicsUnit]::Pixel, $attrs)
+    $dest = New-Object System.Drawing.Rectangle(0, 0, $Width, $Height)
+    $g.DrawImage($src, $dest, $cropX, $cropY, $cropW, $cropH, [System.Drawing.GraphicsUnit]::Pixel, $attrs)
     $g.Dispose()
 
     # Save next to the original picture
-    $folder = Split-Path -Parent (Resolve-Path -LiteralPath $Path).Path
+    $folder = Split-Path -Parent $fullPath
     $local = Join-Path $folder 'theme.bmp'
     $out.Save($local, [System.Drawing.Imaging.ImageFormat]::Bmp)
     $out.Dispose()
