@@ -10,6 +10,9 @@
 //   UP / DOWN  FPS slider 0.1 - 60 fps (hold to scroll, or tap/drag on touch screen)
 //   SELECT     video viewer (play back recordings)
 //   START      quit
+//
+// Custom look: put a 24-bit .bmp at sd:/DSiRecorder/theme.bmp (any size) and it is
+// used as the header icon and a faded background pattern.
 
 #include <dirent.h>
 #include <malloc.h>
@@ -543,6 +546,9 @@ int main(int argc, char **argv)
         waitForStart();
         return 0;
     }
+
+    // Optional custom picture: sd:/DSiRecorder/theme.bmp
+    uiLoadTheme(REC_DIR "/theme.bmp");
 
     // Allocate buffers
     for (int i = 0; i < NUM_FRAMEBUF; i++)
