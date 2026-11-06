@@ -4,7 +4,7 @@
 // weren't closed cleanly play), queues a few decoded frames ahead, and streams
 // the PCM audio into a looping sound channel.
 //
-// Controls (list):    UP/DOWN select, A play, B back to camera
+// Controls (list):    UP/DOWN select, A play, X delete, B back to camera
 // Controls (playing): A pause/resume, R skip +5 s, L restart, B stop
 
 #include <dirent.h>
@@ -558,10 +558,14 @@ static void scanFiles(void)
 #define ITEM_H   24
 #define ITEMS    5
 
-static const UiBox lbBack = { 8, 160, 54, 24 };
-static const UiBox lbUp = { 70, 160, 54, 24 };
-static const UiBox lbDown = { 132, 160, 54, 24 };
-static const UiBox lbPlay = { 194, 160, 54, 24 };
+static const UiBox lbBack = { 8, 160, 44, 24 };
+static const UiBox lbUp = { 56, 160, 44, 24 };
+static const UiBox lbDown = { 104, 160, 44, 24 };
+static const UiBox lbDelete = { 152, 160, 44, 24 };
+static const UiBox lbPlay = { 200, 160, 48, 24 };
+
+static const UiBox dlgCancel = { 32, 120, 88, 24 };
+static const UiBox dlgDelete = { 136, 120, 88, 24 };
 
 static void drawList(int sel, int top, int pressedBtn)
 {
@@ -612,8 +616,63 @@ static void drawList(int sel, int top, int pressedBtn)
     uiButton(lbBack, "Back", pressedBtn == 1 ? 1 : 0);
     uiButton(lbUp, "Up", !any || sel == 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
     uiButton(lbDown, "Down", !any || sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
+    uiButton(lbDelete, "Del", !any ? 2 : (pressedBtn == 5 ? 1 : 0));
     uiButton(lbPlay, "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
     uiPresent();
+}
+
+// "Delete this video?" dialog. Returns true if the user confirmed.
+static void drawConfirm(const char *name, int pressedBtn)
+{
+    uiBegin();
+    uiHeader("Videos");
+    uiCard(16, 40, 224, 112, COL_CARD, COL_RED_EDGE);
+    uiCircle(36, 60, 7, COL_RED);
+    uiRect(35, 55, 2, 6, COL_WHITE);
+    uiRect(35, 63, 2, 2, COL_WHITE);
+    uiText(6, 7, TXT_WHITE, "Delete this video?");
+    uiText(4, 9, TXT_AMBER, "%.24s", name);
+    uiText(4, 11, TXT_MUTED, "This can't be undone.");
+
+    uiButton(dlgCancel, "Cancel", pressedBtn == 1 ? 1 : 0);
+    bool down = pressedBtn == 2;
+    uiCard(dlgDelete.x, dlgDelete.y, dlgDelete.w, dlgDelete.h, down ? COL_RED_DARK : COL_RED,
+           COL_RED_EDGE);
+    uiTextCenter(dlgDelete.x + dlgDelete.w / 2, 16, TXT_WHITE, "Delete");
+
+    uiText(1, 23, TXT_MUTED, "A delete   B cancel");
+    uiPresent();
+}
+
+static bool confirmDelete(const char *name)
+{
+    int pressedBtn = 0;
+    drawConfirm(name, 0);
+    while (1)
+    {
+        swiWaitForVBlank();
+        scanKeys();
+        u32 down = keysDown();
+        if (down & KEY_TOUCH)
+        {
+            touchPosition tp;
+            touchRead(&tp);
+            pressedBtn = uiHit(dlgCancel, tp.px, tp.py) ? 1 : uiHit(dlgDelete, tp.px, tp.py) ? 2 : 0;
+            drawConfirm(name, pressedBtn);
+        }
+        if (keysUp() & KEY_TOUCH)
+        {
+            if (pressedBtn == 1)
+                down |= KEY_B;
+            if (pressedBtn == 2)
+                down |= KEY_A;
+            pressedBtn = 0;
+        }
+        if (down & KEY_A)
+            return true;
+        if (down & KEY_B)
+            return false;
+    }
 }
 
 void runViewer(u16 *vram)
@@ -669,6 +728,7 @@ void runViewer(u16 *vram)
                            : uiHit(lbUp, tp.px, tp.py)     ? 2
                            : uiHit(lbDown, tp.px, tp.py)   ? 3
                            : uiHit(lbPlay, tp.px, tp.py)   ? 4
+                           : uiHit(lbDelete, tp.px, tp.py) ? 5
                                                            : 0;
                 if (pressedBtn == 0 && tp.py >= ITEM_Y0 && tp.py < ITEM_Y0 + ITEMS * ITEM_H)
                 {
@@ -692,12 +752,27 @@ void runViewer(u16 *vram)
                     rep |= KEY_DOWN;
                 if (pressedBtn == 4)
                     down |= KEY_A;
+                if (pressedBtn == 5)
+                    down |= KEY_X;
                 pressedBtn = 0;
                 redraw = true;
             }
 
             if (down & KEY_B)
                 break;
+            if ((down & KEY_X) && numFiles > 0)
+            {
+                if (confirmDelete(names[sel]))
+                {
+                    char path[64];
+                    snprintf(path, sizeof(path), REC_DIR "/%s", names[sel]);
+                    unlink(path);
+                    scanFiles();
+                    if (sel >= numFiles)
+                        sel = numFiles > 0 ? numFiles - 1 : 0;
+                }
+                redraw = true;
+            }
             if ((rep & KEY_DOWN) && sel < numFiles - 1)
             {
                 sel++;
