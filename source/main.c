@@ -22,12 +22,14 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <fat.h>
 #include <nds.h>
 
 #include "avi.h"
 #include "player.h"
+#include "photo.h"
 #include "ui.h"
 
 #define CAMERA_NDMA_CHANNEL 1
@@ -208,6 +210,7 @@ static u32 lastWrittenSeq;
 static u32 recFpsT;                // fps * 10 for the current recording
 static char recPath[64];
 static char statusMsg[33] = "";
+static u32 statusUntil = 0xFFFFFFFF;    // when a temporary message disappears
 
 // Digital zoom, 8.8 fixed point: 256 = 1x .. 1024 = 4x. Applies to preview and recording.
 #define ZOOM_MIN   256
@@ -332,6 +335,7 @@ static u32 batchAudio(u32 offset, u32 maxBytes)
 
 static void startRecording(void)
 {
+    statusUntil = 0xFFFFFFFF;
     mkdir(REC_DIR, 0777);
     snprintf(recPath, sizeof(recPath), REC_DIR "/REC_%04d.AVI", nextFileNumber());
 
@@ -358,6 +362,7 @@ static void startRecording(void)
 
 static void stopRecording(const char *reason)
 {
+    statusUntil = 0xFFFFFFFF;
     if (!recording)
         return;
     recording = false;
@@ -452,11 +457,12 @@ static void recordTick(void)
 static const UiBox btnCamera = { 8, 120, 76, 24 };
 static const UiBox btnMic = { 90, 120, 76, 24 };
 static const UiBox btnVideos = { 172, 120, 76, 24 };
-static const UiBox btnRec = { 8, 148, 240, 32 };
+static const UiBox btnRec = { 8, 148, 176, 32 };
+static const UiBox btnPhoto = { 188, 148, 60, 32 };
 static const UiBox sliderZone = { 0, 84, 256, 34 };
 static const UiBox btnZoom = { 192, 36, 52, 16 };
 
-enum { PRESS_NONE, PRESS_CAMERA, PRESS_MIC, PRESS_VIDEOS, PRESS_REC, PRESS_ZOOM };
+enum { PRESS_NONE, PRESS_CAMERA, PRESS_MIC, PRESS_VIDEOS, PRESS_REC, PRESS_ZOOM, PRESS_PHOTO };
 static int pressed = PRESS_NONE;
 
 // Slider position (0..1000) <-> fps in tenths (1 = 0.1 fps .. 600 = 60 fps)
@@ -551,10 +557,15 @@ static void drawUi(int camera)
         uiText(13, 5, TXT_WHITE, "%s", camera == CAMERA_INNER ? "Inner" : "Outer");
         uiText(2, 6, TXT_MUTED, "Microphone");
         uiText(13, 6, useAudio ? TXT_GREEN : TXT_MUTED, "%s", useAudio ? "On" : "Off");
-        uiText(2, 7, TXT_MUTED, "Saves to");
-        uiText(13, 7, TXT_WHITE, "sd:/DSiRecorder");
+        uiText(2, 7, TXT_MUTED, "Album");
+        uiText(13, 7, TXT_GREEN, "%.15s", photoAlbumLabel(photoSaveDir()));
+        if (statusMsg[0] && vblankCount >= statusUntil)
+        {
+            statusMsg[0] = 0;
+            statusUntil = 0xFFFFFFFF;
+        }
         if (statusMsg[0])
-            uiText(2, 8, TXT_AMBER, "%.28s", statusMsg);
+            uiText(2, 8, statusUntil != 0xFFFFFFFF ? TXT_GREEN : TXT_AMBER, "%.28s", statusMsg);
         else
             uiText(2, 8, TXT_ACCENT, "Ready to record");
     }
@@ -570,7 +581,7 @@ static void drawUi(int camera)
     uiButton(btnCamera, "Camera", pressed == PRESS_CAMERA ? 1 : 0);
     uiButton(btnMic, useAudio ? "Mic: On" : "Mic: Off",
              recording ? 2 : (pressed == PRESS_MIC ? 1 : 0));
-    uiButton(btnVideos, "Videos", recording ? 2 : (pressed == PRESS_VIDEOS ? 1 : 0));
+    uiButton(btnVideos, "Gallery", recording ? 2 : (pressed == PRESS_VIDEOS ? 1 : 0));
 
     // Big record / stop button
     bool down = pressed == PRESS_REC;
@@ -578,16 +589,30 @@ static void drawUi(int camera)
     {
         uiCard(btnRec.x, btnRec.y, btnRec.w, btnRec.h, down ? COL_RED_DARK : UIC(10, 3, 5),
                COL_RED_EDGE);
-        uiRect(100, 158, 12, 12, COL_WHITE);
-        uiText(15, 20, TXT_WHITE, "STOP");
+        uiRect(72, 158, 12, 12, COL_WHITE);
+        uiText(11, 20, TXT_WHITE, "STOP");
     }
     else
     {
         uiCard(btnRec.x, btnRec.y, btnRec.w, btnRec.h, down ? COL_RED_DARK : COL_RED,
                COL_RED_EDGE);
         uiRound(btnRec.x + 6, btnRec.y + 2, btnRec.w - 12, 3, 1, UIC(31, 12, 14));
-        uiCircle(98, 164, 6, COL_WHITE);
-        uiText(14, 20, TXT_WHITE, "RECORD");
+        uiCircle(68, 164, 6, COL_WHITE);
+        uiText(10, 20, TXT_WHITE, "RECORD");
+    }
+
+    // Photo button (little camera icon + PHOTO)
+    {
+        bool dis = recording;
+        bool pd = pressed == PRESS_PHOTO;
+        uiCard(btnPhoto.x, btnPhoto.y, btnPhoto.w, btnPhoto.h,
+               dis ? COL_DISABLED : (pd ? COL_PRESSED : COL_BUTTON), dis ? COL_DISABLED : COL_ACCENT);
+        u16 ic = dis ? COL_CARD_EDGE : COL_WHITE;
+        uiRect(210, 153, 6, 2, ic);
+        uiRound(205, 155, 18, 11, 2, ic);
+        uiCircle(214, 160, 3, dis ? COL_DISABLED : (pd ? COL_PRESSED : COL_BUTTON));
+        uiCircle(214, 160, 1, ic);
+        uiTextCenter(btnPhoto.x + btnPhoto.w / 2, 21, dis ? TXT_MUTED : TXT_WHITE, "PHOTO");
     }
 
     // Zoom chip (top-right of the info card): tap to jump 1x/2x/3x/4x
@@ -603,8 +628,33 @@ static void drawUi(int camera)
         uiTextCenter(btnZoom.x + btnZoom.w / 2, 5, TXT_WHITE, z);
     }
 
-    uiText(1, 23, TXT_MUTED, "A rec L/R cam  Left/Right zoom");
+    uiText(1, 23, TXT_MUTED, "A rec Y photo L/R cam <> zoom");
     uiPresent();
+}
+
+// Shutter: freeze the preview, white flash, save what's on the top screen
+static void takePhoto(void)
+{
+    cameraPause();
+    setBrightness(1, 16);                       // flash the top screen white
+    char shot[16];
+    bool ok = photoSave(previewVram, zoomQ8, shot);
+    for (int i = 16; i > 0; i -= 2)
+    {
+        setBrightness(1, i);
+        swiWaitForVBlank();
+    }
+    setBrightness(1, 0);
+    if (ok)
+        snprintf(statusMsg, sizeof(statusMsg), "Saved %s", shot);
+    else
+        snprintf(statusMsg, sizeof(statusMsg), "Photo save failed!");
+    statusUntil = vblankCount + 240;
+    if (!cameraResume())
+    {
+        snprintf(statusMsg, sizeof(statusMsg), "Camera restart failed!");
+        statusUntil = 0xFFFFFFFF;
+    }
 }
 
 int main(int argc, char **argv)
@@ -638,6 +688,13 @@ int main(int argc, char **argv)
         waitForStart();
         return 0;
     }
+
+    // Always keep files on the SD card, even when this app was started from the
+    // DSi's internal memory (NAND). Falls back to the flashcard if there's no SD.
+    if (chdir("sd:/") != 0)
+        chdir("fat:/");
+    nandInit(true);                 // read-only: lets the gallery show DSi Camera photos
+    photoInit();
 
     // Optional custom picture: sd:/DSiRecorder/theme.bmp
     uiLoadTheme(REC_DIR "/theme.bmp");
@@ -704,6 +761,8 @@ int main(int argc, char **argv)
         {
             if (uiHit(btnRec, tp.px, tp.py))
                 pressed = PRESS_REC;
+            else if (uiHit(btnPhoto, tp.px, tp.py) && !recording)
+                pressed = PRESS_PHOTO;
             else if (uiHit(btnZoom, tp.px, tp.py))
                 pressed = PRESS_ZOOM;
             else if (uiHit(btnCamera, tp.px, tp.py))
@@ -730,6 +789,12 @@ int main(int argc, char **argv)
                 stopRecording(NULL);
             else
                 startRecording();
+            uiTimer = 0;
+        }
+
+        if (((down & KEY_Y) || action == PRESS_PHOTO) && !recording)
+        {
+            takePhoto();
             uiTimer = 0;
         }
 

@@ -22,11 +22,11 @@
 
 #include "player.h"
 #include "ui.h"
+#include "photo.h"
 
 extern volatile u32 vblankCount;     // incremented by main.c's VBlank handler
 
 #define REC_DIR      "/DSiRecorder"
-#define PHOTO_DIR    "/DCIM/100DSI00"        // snapshots (standard camera folder layout)
 #define FRAME_W      256
 #define FRAME_H      192
 #define FRAME_BYTES  (FRAME_W * FRAME_H * 2)
@@ -295,83 +295,6 @@ static const UiBox pbBack = { 192, 120, 56, 24 };
 static char snapMsg[32];
 static u32 snapMsgUntil;
 
-static void put32le(u8 *p, u32 v)
-{
-    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
-}
-
-static int nextPhotoNumber(void)
-{
-    int highest = 0;
-    DIR *d = opendir(PHOTO_DIR);
-    if (d == NULL)
-        return 1;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL)
-    {
-        if (strncasecmp(e->d_name, "IMG_", 4) == 0)
-        {
-            int n = atoi(e->d_name + 4);
-            if (n > highest)
-                highest = n;
-        }
-    }
-    closedir(d);
-    return highest + 1;
-}
-
-// Saves what's on the top screen (the paused frame) as a 24-bit BMP photo.
-static bool saveSnapshot(const u16 *vram, char *nameOut)
-{
-    mkdir("/DCIM", 0777);
-    mkdir(PHOTO_DIR, 0777);
-    char path[64];
-    int n = nextPhotoNumber();
-    snprintf(nameOut, 16, "IMG_%04d.BMP", n);
-    snprintf(path, sizeof(path), PHOTO_DIR "/%s", nameOut);
-
-    const u32 rowBytes = FRAME_W * 3;                 // 768, already a multiple of 4
-    const u32 dataBytes = rowBytes * FRAME_H;
-    u8 hdr[54];
-    memset(hdr, 0, sizeof(hdr));
-    hdr[0] = 'B';
-    hdr[1] = 'M';
-    put32le(hdr + 2, 54 + dataBytes);
-    put32le(hdr + 10, 54);
-    put32le(hdr + 14, 40);
-    put32le(hdr + 18, FRAME_W);
-    put32le(hdr + 22, FRAME_H);                       // positive = bottom-up rows
-    hdr[26] = 1;
-    hdr[28] = 24;
-    put32le(hdr + 34, dataBytes);
-    put32le(hdr + 38, 2835);                          // 72 dpi
-    put32le(hdr + 42, 2835);
-
-    int fdOut = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fdOut < 0)
-        return false;
-    bool ok = write(fdOut, hdr, 54) == 54;
-
-    u8 *buf = tmp;                                    // reuse the viewer's scratch buffer
-    for (int y = FRAME_H - 1; y >= 0 && ok; y--)
-    {
-        const u16 *s = vram + y * FRAME_W;
-        u8 *d = buf;
-        for (int x = 0; x < FRAME_W; x++)
-        {
-            u16 v = s[x];
-            int r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
-            *d++ = (b << 3) | (b >> 2);
-            *d++ = (g << 3) | (g >> 2);
-            *d++ = (r << 3) | (r >> 2);
-        }
-        ok = write(fdOut, buf, rowBytes) == (ssize_t)rowBytes;
-    }
-    close(fdOut);
-    if (!ok)
-        unlink(path);
-    return ok;
-}
 static const UiBox pbPlay = { 8, 148, 240, 32 };
 
 static bool ended(void)
@@ -534,8 +457,9 @@ static void playFile(const char *name, u16 *vram)
                     soundPause(sndId);
             }
             char shot[16];
-            if (saveSnapshot(vram, shot))
-                snprintf(snapMsg, sizeof(snapMsg), "Saved photo %s", shot);
+            if (photoSave(vram, 256, shot))
+                snprintf(snapMsg, sizeof(snapMsg), "Saved %s to %.10s", shot,
+                         photoAlbumLabel(photoSaveDir()));
             else
                 snprintf(snapMsg, sizeof(snapMsg), "Couldn't save photo!");
             snapMsgUntil = vblankCount + 180;           // show for ~3 s
@@ -626,139 +550,344 @@ static void playFile(const char *name, u16 *vram)
 }
 
 // ---------------------------------------------------------------------------
-// File list
+// Gallery
+//
+// Videos tab: every AVI in sd:/DSiRecorder.
+// Photos tab: albums (folders in sd:/DCIM, plus Pictures/Photos/Images and the
+// DSi Camera's own photos on the NAND, read only) -> the pictures inside.
 
-static char (*names)[32];
-static u32 *sizesKb;
+typedef struct
+{
+    char path[96];
+    u32 kb;
+    u32 mtime;
+    bool system;          // on the NAND: read only
+} Entry;
+
+typedef struct
+{
+    char path[64];
+    int depth;            // how many subfolder levels hold its pictures
+    int count;
+    bool system;
+} Album;
+
+#define MAX_ALBUMS  48
+#define NAME_MAX_LEN 16
+
+static Entry *ents;
 static int numFiles;
+static Album *albums;
+static int numAlbums;
+static int tab;            // 0 = videos, 1 = photos
+static int curAlbum = -1;  // photos tab: -1 = album list, otherwise an album index
 
-static int cmpNames(const void *a, const void *b)
+static char note[32];
+static u32 noteUntil;
+
+static void setNote(const char *fmt, const char *arg)
 {
-    return strcasecmp((const char *)b, (const char *)a);   // newest (highest number) first
+    snprintf(note, sizeof(note), fmt, arg);
+    noteUntil = vblankCount + 180;
 }
 
-static int tab;                       // 0 = videos, 1 = photos
-
-static const char *tabDir(void)
+static const char *baseName(const char *p)
 {
-    return tab ? PHOTO_DIR : REC_DIR;
+    const char *s = strrchr(p, '/');
+    return s ? s + 1 : p;
 }
 
-static void scanFiles(void)
+static bool isSystemPath(const char *p)
 {
-    numFiles = 0;
-    const char *ext = tab ? ".BMP" : ".AVI";
-    DIR *d = opendir(tabDir());
+    return strncmp(p, NAND_ALBUM, sizeof(NAND_ALBUM) - 1) == 0;
+}
+
+static bool wantFile(const char *name, bool images)
+{
+    if (name[0] == '.')
+        return false;
+    if (images)
+        return photoIsImage(name);
+    size_t n = strlen(name);
+    return n > 4 && strcasecmp(name + n - 4, ".avi") == 0;
+}
+
+static int cmpEnt(const void *a, const void *b)
+{
+    const Entry *x = a, *y = b;
+    if (x->mtime != y->mtime)
+        return x->mtime < y->mtime ? 1 : -1;        // newest first
+    return strcasecmp(y->path, x->path);
+}
+
+static void addFiles(const char *dir, bool images, int depth)
+{
+    DIR *d = opendir(dir);
     if (d == NULL)
         return;
     struct dirent *e;
     while ((e = readdir(d)) != NULL && numFiles < MAX_FILES)
     {
-        size_t len = strlen(e->d_name);
-        if (len < 5 || len >= 32 || strcasecmp(e->d_name + len - 4, ext) != 0)
+        if (e->d_name[0] == '.')
             continue;
-        strcpy(names[numFiles], e->d_name);
-        numFiles++;
+        char p[96];
+        if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int)sizeof(p))
+            continue;
+        if (e->d_type == DT_DIR)
+        {
+            if (depth > 0)
+                addFiles(p, images, depth - 1);
+            continue;
+        }
+        if (!wantFile(e->d_name, images))
+            continue;
+        Entry *en = &ents[numFiles++];
+        strcpy(en->path, p);
+        en->kb = 0;
+        en->mtime = 0;
+        en->system = isSystemPath(p);
+        struct stat st;
+        if (stat(p, &st) == 0)
+        {
+            en->kb = (u32)(st.st_size / 1024);
+            en->mtime = (u32)st.st_mtime;
+        }
     }
     closedir(d);
-    qsort(names, numFiles, sizeof(names[0]), cmpNames);
+}
 
-    for (int i = 0; i < numFiles; i++)
+static int countImages(const char *dir, int depth)
+{
+    DIR *d = opendir(dir);
+    if (d == NULL)
+        return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
     {
-        char path[64];
-        struct stat st;
-        snprintf(path, sizeof(path), "%s/%s", tabDir(), names[i]);
-        sizesKb[i] = stat(path, &st) == 0 ? (u32)(st.st_size / 1024) : 0;
+        if (e->d_name[0] == '.')
+            continue;
+        if (e->d_type == DT_DIR)
+        {
+            if (depth > 0)
+            {
+                char p[96];
+                snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+                int c = countImages(p, depth - 1);
+                if (c > 0)
+                    n += c;
+            }
+        }
+        else if (photoIsImage(e->d_name))
+        {
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+static void addAlbum(const char *path, int depth, bool needPictures)
+{
+    if (numAlbums >= MAX_ALBUMS)
+        return;
+    int c = countImages(path, depth);
+    if (c < 0 || (needPictures && c == 0))
+        return;
+    Album *a = &albums[numAlbums++];
+    snprintf(a->path, sizeof(a->path), "%s", path);
+    a->depth = depth;
+    a->count = c;
+    a->system = isSystemPath(path);
+}
+
+static int cmpAlbum(const void *a, const void *b)
+{
+    return strcasecmp(baseName(((const Album *)a)->path), baseName(((const Album *)b)->path));
+}
+
+static void scanAlbums(void)
+{
+    numAlbums = 0;
+    mkdir(ALBUM_ROOT, 0777);
+    mkdir(PHOTO_DIR, 0777);
+    addAlbum(PHOTO_DIR, 0, false);                     // "Camera roll" always first
+
+    int first = numAlbums;
+    DIR *d = opendir(ALBUM_ROOT);
+    if (d)
+    {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL)
+        {
+            if (e->d_name[0] == '.' || e->d_type != DT_DIR)
+                continue;
+            char p[64];
+            snprintf(p, sizeof(p), ALBUM_ROOT "/%s", e->d_name);
+            if (strcasecmp(p, PHOTO_DIR) != 0)
+                addAlbum(p, 0, false);
+        }
+        closedir(d);
+    }
+    qsort(albums + first, numAlbums - first, sizeof(Album), cmpAlbum);
+
+    addAlbum(ALBUM_ROOT, 0, true);                     // loose pictures in DCIM
+    addAlbum("/Pictures", 0, false);
+    addAlbum("/Photos", 0, false);
+    addAlbum("/Images", 0, false);
+    addAlbum(NAND_ALBUM, 1, true);                     // DSi Camera photos
+}
+
+static void scanFiles(void)
+{
+    numFiles = 0;
+    if (tab == 0)
+        addFiles(REC_DIR, false, 0);
+    else if (curAlbum >= 0)
+        addFiles(albums[curAlbum].path, true, albums[curAlbum].depth);
+    qsort(ents, numFiles, sizeof(Entry), cmpEnt);
+}
+
+static const char *albumLabel(int i)
+{
+    if (strcmp(albums[i].path, ALBUM_ROOT) == 0)
+        return "DCIM (loose)";
+    return photoAlbumLabel(albums[i].path);
+}
+
+static bool canBeCameraAlbum(const char *path)
+{
+    return strncmp(path, ALBUM_ROOT "/", sizeof(ALBUM_ROOT)) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// On-screen keyboard (for album names)
+
+static const char *kbRows[4] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL-", "ZXCVBNM_" };
+static const UiBox kbShift = { 8, 153, 36, 22 };
+static const UiBox kbSpace = { 48, 153, 92, 22 };
+static const UiBox kbBack = { 144, 153, 44, 22 };
+static const UiBox kbOk = { 192, 153, 56, 22 };
+
+static UiBox kbKey(int r, int c)
+{
+    int n = (int)strlen(kbRows[r]);
+    int x0 = 8 + (10 - n) * 12;                        // centre shorter rows
+    UiBox b = { x0 + c * 24, 57 + r * 24, 22, 22 };
+    return b;
+}
+
+static void drawKeyboard(const char *title, const char *text, bool lower, int pr, int pc)
+{
+    uiBegin();
+    uiHeader(title);
+    uiCard(8, 30, 240, 22, COL_CARD, COL_ACCENT);
+    uiText(2, 5, TXT_WHITE, "%s%s", text, ((vblankCount / 30) & 1) ? "_" : " ");
+    for (int r = 0; r < 4; r++)
+    {
+        for (int c = 0; kbRows[r][c]; c++)
+        {
+            char s[2] = { kbRows[r][c], 0 };
+            if (lower && s[0] >= 'A' && s[0] <= 'Z')
+                s[0] += 'a' - 'A';
+            uiButton(kbKey(r, c), s, (pr == r && pc == c) ? 1 : 0);
+        }
+    }
+    uiButton(kbShift, lower ? "abc" : "ABC", pr == 4 && pc == 0 ? 1 : 0);
+    uiButton(kbSpace, "space", pr == 4 && pc == 1 ? 1 : 0);
+    uiButton(kbBack, "<-", pr == 4 && pc == 2 ? 1 : 0);
+    uiButton(kbOk, "OK", text[0] ? (pr == 4 && pc == 3 ? 1 : 0) : 2);
+    uiText(1, 23, TXT_MUTED, "A/START ok  Y erase  B cancel");
+    uiPresent();
+}
+
+// Returns false if cancelled. 'out' must hold NAME_MAX_LEN + 1 bytes.
+static bool kbdInput(const char *title, char *out)
+{
+    int len = 0;
+    out[0] = 0;
+    bool lower = true;
+    int pr = -1, pc = -1;
+    int redraw = 0;
+    while (1)
+    {
+        if (--redraw <= 0)
+        {
+            drawKeyboard(title, out, lower, pr, pc);
+            redraw = 15;
+        }
+        swiWaitForVBlank();
+        scanKeys();
+        u32 down = keysDown();
+        if (down & KEY_TOUCH)
+        {
+            touchPosition tp;
+            touchRead(&tp);
+            pr = pc = -1;
+            for (int r = 0; r < 4 && pr < 0; r++)
+                for (int c = 0; kbRows[r][c]; c++)
+                    if (uiHit(kbKey(r, c), tp.px, tp.py))
+                    {
+                        pr = r;
+                        pc = c;
+                        break;
+                    }
+            if (pr < 0)
+            {
+                pc = uiHit(kbShift, tp.px, tp.py) ? 0 : uiHit(kbSpace, tp.px, tp.py) ? 1
+                   : uiHit(kbBack, tp.px, tp.py)  ? 2 : uiHit(kbOk, tp.px, tp.py)    ? 3 : -1;
+                pr = pc >= 0 ? 4 : -1;
+            }
+            redraw = 0;
+        }
+        if (keysUp() & KEY_TOUCH)
+        {
+            char ch = 0;
+            if (pr >= 0 && pr < 4)
+            {
+                ch = kbRows[pr][pc];
+                if (lower && ch >= 'A' && ch <= 'Z')
+                    ch += 'a' - 'A';
+            }
+            else if (pr == 4 && pc == 0)
+                lower = !lower;
+            else if (pr == 4 && pc == 1)
+                ch = ' ';
+            else if (pr == 4 && pc == 2)
+                down |= KEY_Y;
+            else if (pr == 4 && pc == 3)
+                down |= KEY_A;
+            if (ch && len < NAME_MAX_LEN && !(ch == ' ' && len == 0))
+            {
+                out[len++] = ch;
+                out[len] = 0;
+            }
+            pr = pc = -1;
+            redraw = 0;
+        }
+        if ((down & KEY_Y) && len > 0)
+        {
+            out[--len] = 0;
+            redraw = 0;
+        }
+        if (down & KEY_B)
+            return false;
+        if ((down & (KEY_A | KEY_START)) && len > 0)
+        {
+            while (len > 0 && out[len - 1] == ' ')
+                out[--len] = 0;                        // no trailing spaces
+            return len > 0;
+        }
     }
 }
 
-#define ITEM_Y0  32
-#define ITEM_H   24
-#define ITEMS    5
-
-static const UiBox lbBack = { 8, 160, 44, 24 };
-static const UiBox lbUp = { 56, 160, 44, 24 };
-static const UiBox lbDown = { 104, 160, 44, 24 };
-static const UiBox lbDelete = { 152, 160, 44, 24 };
-static const UiBox lbPlay = { 200, 160, 48, 24 };
-
-static const UiBox tabVideos = { 136, 4, 54, 15 };
-static const UiBox tabPhotos = { 192, 4, 56, 15 };
+// ---------------------------------------------------------------------------
+// Dialogs
 
 static const UiBox dlgCancel = { 32, 120, 88, 24 };
 static const UiBox dlgDelete = { 136, 120, 88, 24 };
 
-static void drawList(int sel, int top, int pressedBtn)
-{
-    uiBegin();
-    uiHeader("Gallery");
-
-    // Tabs (tap, or press L/R)
-    uiRound(tabVideos.x, tabVideos.y, tabVideos.w, tabVideos.h, 7, tab == 0 ? COL_ACCENT : COL_BUTTON);
-    uiRound(tabPhotos.x, tabPhotos.y, tabPhotos.w, tabPhotos.h, 7, tab == 1 ? COL_ACCENT : COL_BUTTON);
-    uiText(18, 1, tab == 0 ? TXT_DARK : TXT_MUTED, "Videos");
-    uiText(25, 1, tab == 1 ? TXT_DARK : TXT_MUTED, "Photos");
-
-    if (numFiles == 0)
-    {
-        uiCard(8, 40, 240, 80, COL_CARD, COL_CARD_EDGE);
-        uiText(3, 8, TXT_WHITE, tab ? "No photos yet" : "No videos yet");
-        if (tab)
-        {
-            uiText(3, 10, TXT_MUTED, "Pause a video and press Y");
-            uiText(3, 11, TXT_MUTED, "(or Photo) to save a frame.");
-        }
-        else
-        {
-            uiText(3, 10, TXT_MUTED, "Record something first, then");
-            uiText(3, 11, TXT_MUTED, "it will show up here.");
-        }
-    }
-
-    for (int r = 0; r < ITEMS; r++)
-    {
-        int i = top + r;
-        if (i >= numFiles)
-            break;
-        int y = ITEM_Y0 + r * ITEM_H;
-        int row = (y + ITEM_H / 2 - 4) / 8;
-        bool s = i == sel;
-        uiCard(8, y + 1, 240, ITEM_H - 2, s ? UIC(6, 15, 23) : COL_CARD, s ? COL_ACCENT : COL_CARD_EDGE);
-        if (s)
-            uiTriangleRight(16, y + 8, 9, COL_WHITE);
-        else
-            uiCircle(19, y + 12, 2, COL_CARD_EDGE);
-
-        u32 kb = sizesKb[i];
-        uiText(4, row, TXT_WHITE, "%.17s", names[i]);
-        if (kb >= 1024)
-            uiText(20, row, s ? TXT_WHITE : TXT_MUTED, "%5lu.%lu MB", (unsigned long)(kb / 1024),
-                   (unsigned long)((kb % 1024) * 10 / 1024));
-        else
-            uiText(20, row, s ? TXT_WHITE : TXT_MUTED, "%7lu KB", (unsigned long)kb);
-    }
-
-    // scroll indicator
-    if (numFiles > ITEMS)
-    {
-        int h = ITEMS * ITEM_H * ITEMS / numFiles;
-        int y = ITEM_Y0 + (ITEMS * ITEM_H - h) * top / (numFiles - ITEMS);
-        uiRound(250, y, 3, h, 1, COL_CARD_EDGE);
-    }
-
-    bool any = numFiles > 0;
-    uiButton(lbBack, "Back", pressedBtn == 1 ? 1 : 0);
-    uiButton(lbUp, "Up", !any || sel == 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
-    uiButton(lbDown, "Down", !any || sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
-    uiButton(lbDelete, "Del", !any ? 2 : (pressedBtn == 5 ? 1 : 0));
-    uiButton(lbPlay, tab ? "View" : "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
-    uiText(1, 23, TXT_MUTED, "%d %s   L/R switch tab", numFiles,
-           tab ? (numFiles == 1 ? "photo" : "photos") : (numFiles == 1 ? "video" : "videos"));
-    uiPresent();
-}
-
-// "Delete this video?" dialog. Returns true if the user confirmed.
-static void drawConfirm(const char *name, int pressedBtn)
+static void drawConfirm(const char *question, const char *name, const char *extra, int pressedBtn)
 {
     uiBegin();
     uiHeader("Gallery");
@@ -766,9 +895,9 @@ static void drawConfirm(const char *name, int pressedBtn)
     uiCircle(36, 60, 7, COL_RED);
     uiRect(35, 55, 2, 6, COL_WHITE);
     uiRect(35, 63, 2, 2, COL_WHITE);
-    uiText(6, 7, TXT_WHITE, tab ? "Delete this photo?" : "Delete this video?");
+    uiText(6, 7, TXT_WHITE, "%s", question);
     uiText(4, 9, TXT_AMBER, "%.24s", name);
-    uiText(4, 11, TXT_MUTED, "This can't be undone.");
+    uiText(4, 11, TXT_MUTED, "%s", extra ? extra : "This can't be undone.");
 
     uiButton(dlgCancel, "Cancel", pressedBtn == 1 ? 1 : 0);
     bool down = pressedBtn == 2;
@@ -780,10 +909,10 @@ static void drawConfirm(const char *name, int pressedBtn)
     uiPresent();
 }
 
-static bool confirmDelete(const char *name)
+static bool confirmDelete(const char *question, const char *name, const char *extra)
 {
     int pressedBtn = 0;
-    drawConfirm(name, 0);
+    drawConfirm(question, name, extra, 0);
     while (1)
     {
         swiWaitForVBlank();
@@ -794,7 +923,7 @@ static bool confirmDelete(const char *name)
             touchPosition tp;
             touchRead(&tp);
             pressedBtn = uiHit(dlgCancel, tp.px, tp.py) ? 1 : uiHit(dlgDelete, tp.px, tp.py) ? 2 : 0;
-            drawConfirm(name, pressedBtn);
+            drawConfirm(question, name, extra, pressedBtn);
         }
         if (keysUp() & KEY_TOUCH)
         {
@@ -812,100 +941,480 @@ static bool confirmDelete(const char *name)
 }
 
 // ---------------------------------------------------------------------------
-// Photo viewer
+// Album operations
 
-static const UiBox phBack = { 8, 148, 56, 32 };
-static const UiBox phPrev = { 68, 148, 56, 32 };
-static const UiBox phNext = { 128, 148, 56, 32 };
-static const UiBox phDel = { 188, 148, 60, 32 };
-
-// Loads a 24/32-bit BMP onto the top screen, scaled to fit (letterboxed).
-static bool showPhoto(const char *name, u16 *vram)
+static bool validName(const char *s)
 {
-    char path[64];
-    snprintf(path, sizeof(path), PHOTO_DIR "/%s", name);
-    memset(vram, 0, 256 * 192 * 2);
+    for (; *s; s++)
+        if (strchr("\\/:*?\"<>|", *s))
+            return false;
+    return true;
+}
 
-    int f = open(path, O_RDONLY);
-    if (f < 0)
-        return false;
-    u8 h[54];
-    bool ok = read(f, h, 54) == 54 && h[0] == 'B' && h[1] == 'M';
-    u32 off = ok ? rd32(h + 10) : 0;
-    int w = ok ? (int)rd32(h + 18) : 0;
-    int ht = ok ? (int)rd32(h + 22) : 0;
-    int bpp = ok ? (h[28] | (h[29] << 8)) : 0;
-    bool topDown = ht < 0;
-    if (topDown)
-        ht = -ht;
-    ok = ok && w > 0 && ht > 0 && w <= 4096 && ht <= 4096 && (bpp == 24 || bpp == 32);
-    if (!ok)
+// Creates sd:/DCIM/<name>. Returns its index in albums[] or -1.
+static int newAlbum(void)
+{
+    char name[NAME_MAX_LEN + 1];
+    if (!kbdInput("New album", name))
+        return -1;
+    char p[64];
+    snprintf(p, sizeof(p), ALBUM_ROOT "/%s", name);
+    struct stat st;
+    if (!validName(name) || (stat(p, &st) != 0 && mkdir(p, 0777) != 0))
     {
-        close(f);
+        setNote("Couldn't make %.18s", name);
+        return -1;
+    }
+    scanAlbums();
+    for (int i = 0; i < numAlbums; i++)
+        if (strcasecmp(albums[i].path, p) == 0)
+            return i;
+    return -1;
+}
+
+static bool copyFile(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY);
+    if (in < 0)
+        return false;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out < 0)
+    {
+        close(in);
         return false;
     }
-
-    // fit inside 256x192 keeping the aspect ratio
-    int outW = FRAME_W, outH = (ht * FRAME_W) / w;
-    if (outH > FRAME_H)
-    {
-        outH = FRAME_H;
-        outW = (w * FRAME_H) / ht;
-    }
-    int ox = (FRAME_W - outW) / 2, oy = (FRAME_H - outH) / 2;
-    u32 rowBytes = ((u32)w * (bpp / 8) + 3) & ~3u;
-    if (rowBytes > TMP_BYTES)
-    {
-        close(f);
-        return false;
-    }
-
-    for (int y = 0; y < outH && ok; y++)
-    {
-        int sy = (y * ht) / outH;
-        int fileRow = topDown ? sy : (ht - 1 - sy);
-        ok = lseek(f, off + (u32)fileRow * rowBytes, SEEK_SET) >= 0 &&
-             read(f, tmp, rowBytes) == (ssize_t)rowBytes;
-        u16 *d = vram + (oy + y) * FRAME_W + ox;
-        for (int x = 0; x < outW && ok; x++)
+    bool ok = true;
+    ssize_t n;
+    while ((n = read(in, tmp, TMP_BYTES)) > 0)
+        if (write(out, tmp, n) != n)
         {
-            const u8 *px = tmp + ((x * w) / outW) * (bpp / 8);
-            d[x] = RGB15(px[2] >> 3, px[1] >> 3, px[0] >> 3) | BIT(15);
+            ok = false;
+            break;
         }
-    }
-    close(f);
+    if (n < 0)
+        ok = false;
+    close(in);
+    close(out);
+    if (!ok)
+        unlink(dst);
     return ok;
 }
 
-static void drawPhotoUi(int sel, bool ok, int pressedBtn)
+// Moves (or for NAND photos, copies) a picture into another album
+static bool movePicture(const char *src, const char *dstDir, bool copyOnly)
+{
+    const char *name = baseName(src);
+    const char *dot = strrchr(name, '.');
+    int stem = dot ? (int)(dot - name) : (int)strlen(name);
+    char dst[128];
+    struct stat st;
+    snprintf(dst, sizeof(dst), "%s/%s", dstDir, name);
+    for (int k = 2; stat(dst, &st) == 0 && k < 1000; k++)
+        snprintf(dst, sizeof(dst), "%s/%.*s_%d%s", dstDir, stem, name, k, dot ? dot : "");
+
+    if (!copyOnly && rename(src, dst) == 0)
+        return true;
+    if (!copyFile(src, dst))
+        return false;
+    if (!copyOnly)
+        unlink(src);
+    return true;
+}
+
+static bool deleteAlbum(int i)
+{
+    // delete the pictures and anything else directly inside, then the folder
+    DIR *d = opendir(albums[i].path);
+    if (d)
+    {
+        struct dirent *e;
+        char p[96];
+        while ((e = readdir(d)) != NULL)
+        {
+            if (e->d_type == DT_DIR)
+                continue;
+            snprintf(p, sizeof(p), "%s/%s", albums[i].path, e->d_name);
+            unlink(p);
+        }
+        closedir(d);
+    }
+    bool ok = rmdir(albums[i].path) == 0;
+    if (strcasecmp(photoSaveDir(), albums[i].path) == 0)
+        photoSetSaveDir(PHOTO_DIR);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Lists
+
+#define ITEM_Y0  32
+#define ITEM_H   24
+#define ITEMS    5
+#define ROW_W    226
+
+static const UiBox lbBack = { 8, 160, 44, 24 };
+static const UiBox lbUp = { 56, 160, 44, 24 };
+static const UiBox lbDown = { 104, 160, 44, 24 };
+static const UiBox lbDelete = { 152, 160, 44, 24 };
+static const UiBox lbPlay = { 200, 160, 48, 24 };
+// album list / photo list use the same five slots with other labels
+
+static const UiBox scrollUp = { 238, 32, 18, 58 };
+static const UiBox scrollDown = { 238, 92, 18, 58 };
+
+static const UiBox tabVideos = { 136, 4, 54, 15 };
+static const UiBox tabPhotos = { 192, 4, 56, 15 };
+
+static void arrow(int cx, int cy, bool up, u16 c)
+{
+    for (int i = 0; i < 5; i++)
+        uiRect(cx - i, up ? cy + i : cy - i, 2 * i + 1, 1, c);
+}
+
+// What the list currently shows
+static int listCount(void)
+{
+    return (tab == 1 && curAlbum < 0) ? numAlbums : numFiles;
+}
+
+static void drawList(int sel, int top, int pressedBtn, const char *pickTitle)
+{
+    bool albumMode = tab == 1 && curAlbum < 0;
+    int count = listCount();
+
+    uiBegin();
+    if (pickTitle)
+    {
+        uiHeader(pickTitle);
+    }
+    else if (tab == 1 && curAlbum >= 0)
+    {
+        uiHeader(albumLabel(curAlbum));
+        uiText(24, 1, TXT_MUTED, "%3d pics", numFiles);
+    }
+    else
+    {
+        uiHeader("Gallery");
+        uiRound(tabVideos.x, tabVideos.y, tabVideos.w, tabVideos.h, 7, tab == 0 ? COL_ACCENT : COL_BUTTON);
+        uiRound(tabPhotos.x, tabPhotos.y, tabPhotos.w, tabPhotos.h, 7, tab == 1 ? COL_ACCENT : COL_BUTTON);
+        uiText(18, 1, tab == 0 ? TXT_DARK : TXT_MUTED, "Videos");
+        uiText(25, 1, tab == 1 ? TXT_DARK : TXT_MUTED, "Photos");
+    }
+
+    if (count == 0)
+    {
+        uiCard(8, 40, 240, 80, COL_CARD, COL_CARD_EDGE);
+        if (tab == 0)
+        {
+            uiText(3, 8, TXT_WHITE, "No videos yet");
+            uiText(3, 10, TXT_MUTED, "Record something first, then");
+            uiText(3, 11, TXT_MUTED, "it will show up here.");
+        }
+        else
+        {
+            uiText(3, 8, TXT_WHITE, "No photos in this album");
+            uiText(3, 10, TXT_MUTED, "Take photos with PHOTO / Y,");
+            uiText(3, 11, TXT_MUTED, "or copy pictures into");
+            uiText(3, 12, TXT_MUTED, "sd:/DCIM/<album name>");
+        }
+    }
+
+    const char *camDir = photoSaveDir();
+    for (int r = 0; r < ITEMS; r++)
+    {
+        int i = top + r;
+        if (i >= count)
+            break;
+        int y = ITEM_Y0 + r * ITEM_H;
+        int row = (y + ITEM_H / 2 - 4) / 8;
+        bool s = i == sel;
+        uiCard(8, y + 1, ROW_W, ITEM_H - 2, s ? UIC(6, 15, 23) : COL_CARD, s ? COL_ACCENT : COL_CARD_EDGE);
+
+        if (albumMode)
+        {
+            bool cam = strcasecmp(albums[i].path, camDir) == 0;
+            // little folder icon
+            uiRect(15, y + 8, 6, 2, cam ? COL_GREEN : COL_ACCENT);
+            uiRect(15, y + 10, 11, 7, cam ? COL_GREEN : COL_ACCENT);
+            uiText(4, row, cam ? TXT_GREEN : (albums[i].system ? TXT_AMBER : TXT_WHITE), "%.16s",
+                   albumLabel(i));
+            uiText(21, row, s ? TXT_WHITE : TXT_MUTED, "%4d pic", albums[i].count);
+        }
+        else
+        {
+            if (s)
+                uiTriangleRight(16, y + 8, 9, COL_WHITE);
+            else
+                uiCircle(19, y + 12, 2, COL_CARD_EDGE);
+            u32 kb = ents[i].kb;
+            uiText(4, row, TXT_WHITE, "%.15s", baseName(ents[i].path));
+            if (kb >= 1024)
+                uiText(19, row, s ? TXT_WHITE : TXT_MUTED, "%5lu.%lu MB", (unsigned long)(kb / 1024),
+                       (unsigned long)((kb % 1024) * 10 / 1024));
+            else
+                uiText(19, row, s ? TXT_WHITE : TXT_MUTED, "%7lu KB", (unsigned long)kb);
+        }
+    }
+
+    // scroll arrows (tap to page)
+    if (count > ITEMS)
+    {
+        uiRound(scrollUp.x + 2, scrollUp.y, 14, scrollUp.h, 4, top > 0 ? COL_BUTTON : COL_DISABLED);
+        uiRound(scrollDown.x + 2, scrollDown.y, 14, scrollDown.h, 4,
+                top + ITEMS < count ? COL_BUTTON : COL_DISABLED);
+        arrow(247, 57, true, COL_WHITE);
+        arrow(247, 125, false, COL_WHITE);
+    }
+
+    bool any = count > 0;
+    bool sysSel = any && (albumMode ? albums[sel].system : (tab == 1 && ents[sel].system));
+    uiButton(lbBack, "Back", pressedBtn == 1 ? 1 : 0);
+    if (pickTitle)
+    {
+        uiButton(lbUp, "New", pressedBtn == 2 ? 1 : 0);
+        uiButton(lbPlay, "Here", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    }
+    else if (albumMode)
+    {
+        uiButton(lbUp, "New", pressedBtn == 2 ? 1 : 0);
+        uiButton(lbDown, "Cam", !any || !canBeCameraAlbum(albums[sel].path) ? 2 : (pressedBtn == 3 ? 1 : 0));
+        uiButton(lbDelete, "Del", !any || sysSel || sel == 0 ? 2 : (pressedBtn == 5 ? 1 : 0));
+        uiButton(lbPlay, "Open", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    }
+    else if (tab == 1)
+    {
+        uiButton(lbUp, sysSel ? "Copy" : "Move", !any ? 2 : (pressedBtn == 2 ? 1 : 0));
+        uiButton(lbDown, "Cam", !canBeCameraAlbum(albums[curAlbum].path) ? 2 : (pressedBtn == 3 ? 1 : 0));
+        uiButton(lbDelete, "Del", !any || sysSel ? 2 : (pressedBtn == 5 ? 1 : 0));
+        uiButton(lbPlay, "View", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    }
+    else
+    {
+        uiButton(lbUp, "Up", !any || sel == 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
+        uiButton(lbDown, "Down", !any || sel >= count - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
+        uiButton(lbDelete, "Del", !any ? 2 : (pressedBtn == 5 ? 1 : 0));
+        uiButton(lbPlay, "Play", !any ? 2 : (pressedBtn == 4 ? 1 : 0));
+    }
+
+    if (note[0] && vblankCount < noteUntil)
+        uiText(1, 23, TXT_GREEN, "%.30s", note);
+    else if (pickTitle)
+        uiText(1, 23, TXT_MUTED, "A pick album   B cancel");
+    else if (albumMode)
+        uiText(1, 23, TXT_MUTED, "Green = camera album  L/R tab");
+    else if (tab == 1)
+        uiText(1, 23, TXT_MUTED, "Y move  X delete  B albums");
+    else
+        uiText(1, 23, TXT_MUTED, "%d %s   L/R switch tab", numFiles, numFiles == 1 ? "video" : "videos");
+    uiPresent();
+}
+
+// Shared touch / key handling for the lists. Returns the "virtual" keys.
+static u32 listInput(int *sel, int *top, int *pressedBtn, bool *redraw)
+{
+    u32 down = keysDown();
+    u32 rep = keysDownRepeat();
+    int count = listCount();
+
+    if (down & KEY_TOUCH)
+    {
+        touchPosition tp;
+        touchRead(&tp);
+        *pressedBtn = uiHit(lbBack, tp.px, tp.py)   ? 1
+                    : uiHit(lbUp, tp.px, tp.py)     ? 2
+                    : uiHit(lbDown, tp.px, tp.py)   ? 3
+                    : uiHit(lbPlay, tp.px, tp.py)   ? 4
+                    : uiHit(lbDelete, tp.px, tp.py) ? 5
+                                                    : 0;
+        if (count > ITEMS && uiHit(scrollUp, tp.px, tp.py))
+        {
+            *sel = *sel - ITEMS < 0 ? 0 : *sel - ITEMS;
+            *top = *top - ITEMS < 0 ? 0 : *top - ITEMS;
+        }
+        else if (count > ITEMS && uiHit(scrollDown, tp.px, tp.py))
+        {
+            *sel = *sel + ITEMS >= count ? count - 1 : *sel + ITEMS;
+            *top = *top + ITEMS > count - ITEMS ? count - ITEMS : *top + ITEMS;
+        }
+        else if (uiHit(tabVideos, tp.px, tp.py) || uiHit(tabPhotos, tp.px, tp.py))
+        {
+            int want = uiHit(tabPhotos, tp.px, tp.py) ? 1 : 0;
+            if (want != tab)
+                down |= want ? KEY_R : KEY_L;
+        }
+        else if (*pressedBtn == 0 && tp.px < 8 + ROW_W && tp.py >= ITEM_Y0 &&
+                 tp.py < ITEM_Y0 + ITEMS * ITEM_H)
+        {
+            int i = *top + (tp.py - ITEM_Y0) / ITEM_H;
+            if (i < count)
+            {
+                if (i == *sel)
+                    down |= KEY_A;
+                *sel = i;
+            }
+        }
+        *redraw = true;
+    }
+    if (keysUp() & KEY_TOUCH)
+    {
+        // slots: 1 Back, 2 Up/New/Move, 3 Down/Cam, 4 Play/Open/View, 5 Del
+        bool plain = tab == 0;
+        if (*pressedBtn == 1) down |= KEY_B;
+        if (*pressedBtn == 2) { if (plain) rep |= KEY_UP; else down |= KEY_Y; }
+        if (*pressedBtn == 3) { if (plain) rep |= KEY_DOWN; else down |= KEY_START; }
+        if (*pressedBtn == 4) down |= KEY_A;
+        if (*pressedBtn == 5) down |= KEY_X;
+        *pressedBtn = 0;
+        *redraw = true;
+    }
+    if ((rep & KEY_DOWN) && *sel < count - 1)
+    {
+        (*sel)++;
+        *redraw = true;
+    }
+    if ((rep & KEY_UP) && *sel > 0)
+    {
+        (*sel)--;
+        *redraw = true;
+    }
+    if (*sel >= count)
+        *sel = count > 0 ? count - 1 : 0;
+    if (*sel < *top)
+        *top = *sel;
+    if (*sel >= *top + ITEMS)
+        *top = *sel - ITEMS + 1;
+    if (note[0] && vblankCount >= noteUntil)
+    {
+        note[0] = 0;
+        *redraw = true;
+    }
+    return down;
+}
+
+// "Move to..." album picker. Returns an album index, or -1.
+static int pickAlbum(const char *title, int exclude)
+{
+    int saveTab = tab, saveAlbum = curAlbum;
+    tab = 1;
+    curAlbum = -1;
+    int sel = 0, top = 0, pressedBtn = 0;
+    bool redraw = true;
+    int result = -1;
+    while (1)
+    {
+        if (redraw)
+        {
+            drawList(sel, top, pressedBtn, title);
+            redraw = false;
+        }
+        swiWaitForVBlank();
+        scanKeys();
+        u32 down = listInput(&sel, &top, &pressedBtn, &redraw);
+        down &= ~(KEY_L | KEY_R | KEY_START);
+        if (down & KEY_B)
+            break;
+        if (down & KEY_Y)                              // "New"
+        {
+            int n = newAlbum();
+            if (n >= 0)
+            {
+                result = n;
+                break;
+            }
+            redraw = true;
+        }
+        if ((down & KEY_A) && numAlbums > 0)
+        {
+            if (albums[sel].system || sel == exclude)
+                setNote("Pick a different album%s", "");
+            else
+            {
+                result = sel;
+                break;
+            }
+            redraw = true;
+        }
+    }
+    tab = saveTab;
+    curAlbum = saveAlbum;
+    return result;
+}
+
+// Move/copy ents[sel] to another album. Returns true if the list changed.
+static bool doMove(int sel)
+{
+    char albumPath[64];
+    snprintf(albumPath, sizeof(albumPath), "%s", albums[curAlbum].path);
+    bool copy = ents[sel].system;
+    int dst = pickAlbum(copy ? "Copy to..." : "Move to...", curAlbum);
+    // the picker may have rescanned the albums: find ours again
+    for (int i = 0; i < numAlbums; i++)
+        if (strcmp(albums[i].path, albumPath) == 0)
+            curAlbum = i;
+    if (dst < 0)
+        return false;
+    char dstLabel[24];
+    snprintf(dstLabel, sizeof(dstLabel), "%s", albumLabel(dst));
+    if (movePicture(ents[sel].path, albums[dst].path, copy))
+    {
+        setNote(copy ? "Copied to %.18s" : "Moved to %.19s", dstLabel);
+        albums[dst].count++;
+        if (!copy)
+            albums[curAlbum].count--;
+    }
+    else
+    {
+        setNote("Couldn't move to %.13s", dstLabel);
+    }
+    scanFiles();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Photo viewer
+
+static const UiBox phBack = { 8, 148, 44, 32 };
+static const UiBox phPrev = { 56, 148, 44, 32 };
+static const UiBox phNext = { 104, 148, 44, 32 };
+static const UiBox phMove = { 152, 148, 44, 32 };
+static const UiBox phDel = { 200, 148, 48, 32 };
+
+static void drawPhotoUi(int sel, bool ok, const char *err, int pressedBtn)
 {
     uiBegin();
     uiHeader("Photo");
     uiText(23, 1, TXT_MUTED, "%3d / %-3d", sel + 1, numFiles);
-    uiCard(8, 32, 240, 48, COL_CARD, COL_CARD_EDGE);
-    uiText(2, 5, TXT_WHITE, "%.28s", names[sel]);
-    if (ok)
-        uiText(2, 6, TXT_MUTED, "%lu KB   sd:/DCIM/100DSI00", (unsigned long)sizesKb[sel]);
+    uiCard(8, 32, 240, 64, COL_CARD, COL_CARD_EDGE);
+    uiText(2, 5, TXT_WHITE, "%.28s", baseName(ents[sel].path));
+    uiText(2, 6, TXT_MUTED, "%lu KB", (unsigned long)ents[sel].kb);
+    uiText(12, 6, ents[sel].system ? TXT_AMBER : TXT_ACCENT, "%.16s", albumLabel(curAlbum));
+    if (note[0] && vblankCount < noteUntil)
+        uiText(2, 8, TXT_GREEN, "%.28s", note);
+    else if (ok)
+        uiText(2, 8, TXT_MUTED, "Shown on the top screen");
     else
-        uiText(2, 6, TXT_AMBER, "Can't show this file");
-    uiText(2, 8, TXT_ACCENT, "Shown on the top screen");
+        uiText(2, 8, TXT_AMBER, "%.28s", err);
+    if (ents[sel].system)
+        uiText(2, 10, TXT_MUTED, "DSi Camera photo (read only)");
 
+    bool sys = ents[sel].system;
     uiButton(phBack, "Back", pressedBtn == 1 ? 1 : 0);
     uiButton(phPrev, "Prev", sel <= 0 ? 2 : (pressedBtn == 2 ? 1 : 0));
     uiButton(phNext, "Next", sel >= numFiles - 1 ? 2 : (pressedBtn == 3 ? 1 : 0));
-    uiButton(phDel, "Del", pressedBtn == 4 ? 1 : 0);
-    uiText(1, 23, TXT_MUTED, "Left/Right browse  X delete");
+    uiButton(phMove, sys ? "Copy" : "Move", pressedBtn == 5 ? 1 : 0);
+    uiButton(phDel, "Del", sys ? 2 : (pressedBtn == 4 ? 1 : 0));
+    uiText(1, 23, TXT_MUTED, "L/R browse  Y move  X delete");
     uiPresent();
 }
-
-static bool confirmDelete(const char *name);
 
 // Returns the selection to go back to in the list
 static int viewPhotos(int sel, u16 *vram)
 {
     int pressedBtn = 0;
-    bool ok = showPhoto(names[sel], vram);
-    drawPhotoUi(sel, ok, 0);
+    char err[32];
+    bool ok = photoLoad(ents[sel].path, vram, err);
+    drawPhotoUi(sel, ok, err, 0);
+    bool noteShown = false;
     while (numFiles > 0)
     {
         swiWaitForVBlank();
@@ -920,8 +1429,9 @@ static int viewPhotos(int sel, u16 *vram)
                        : uiHit(phPrev, tp.px, tp.py)   ? 2
                        : uiHit(phNext, tp.px, tp.py)   ? 3
                        : uiHit(phDel, tp.px, tp.py)    ? 4
+                       : uiHit(phMove, tp.px, tp.py)   ? 5
                                                        : 0;
-            drawPhotoUi(sel, ok, pressedBtn);
+            drawPhotoUi(sel, ok, err, pressedBtn);
         }
         if (keysUp() & KEY_TOUCH)
         {
@@ -929,24 +1439,24 @@ static int viewPhotos(int sel, u16 *vram)
             if (pressedBtn == 2) rep |= KEY_LEFT;
             if (pressedBtn == 3) rep |= KEY_RIGHT;
             if (pressedBtn == 4) down |= KEY_X;
+            if (pressedBtn == 5) down |= KEY_Y;
             pressedBtn = 0;
-            drawPhotoUi(sel, ok, 0);
+            drawPhotoUi(sel, ok, err, 0);
         }
         if (down & KEY_B)
             break;
 
         int old = sel;
-        if ((rep & (KEY_RIGHT | KEY_DOWN)) && sel < numFiles - 1)
+        if ((rep & (KEY_RIGHT | KEY_DOWN | KEY_R)) && sel < numFiles - 1)
             sel++;
-        if ((rep & (KEY_LEFT | KEY_UP)) && sel > 0)
+        if ((rep & (KEY_LEFT | KEY_UP | KEY_L)) && sel > 0)
             sel--;
-        if (down & KEY_X)
+        if ((down & KEY_X) && !ents[sel].system)
         {
-            if (confirmDelete(names[sel]))
+            if (confirmDelete("Delete this photo?", baseName(ents[sel].path), NULL))
             {
-                char path[64];
-                snprintf(path, sizeof(path), PHOTO_DIR "/%s", names[sel]);
-                unlink(path);
+                unlink(ents[sel].path);
+                albums[curAlbum].count--;
                 scanFiles();
                 if (sel >= numFiles)
                     sel = numFiles > 0 ? numFiles - 1 : 0;
@@ -955,15 +1465,39 @@ static int viewPhotos(int sel, u16 *vram)
             }
             old = -1;                                   // reload + redraw
         }
+        if (down & KEY_Y)
+        {
+            char keep[96];
+            snprintf(keep, sizeof(keep), "%s", ents[sel].path);
+            doMove(sel);
+            if (numFiles == 0)
+                break;
+            // stay on the same picture if it's still here, else the next one
+            for (int i = 0; i < numFiles; i++)
+                if (strcmp(ents[i].path, keep) == 0)
+                    sel = i;
+            if (sel >= numFiles)
+                sel = numFiles - 1;
+            old = -1;
+            noteShown = true;
+        }
         if (sel != old)
         {
-            ok = showPhoto(names[sel], vram);
-            drawPhotoUi(sel, ok, 0);
+            ok = photoLoad(ents[sel].path, vram, err);
+            drawPhotoUi(sel, ok, err, 0);
+        }
+        else if (noteShown && vblankCount >= noteUntil)
+        {
+            noteShown = false;
+            note[0] = 0;
+            drawPhotoUi(sel, ok, err, 0);
         }
     }
     memset(vram, 0, 256 * 192 * 2);
     return sel;
 }
+
+// ---------------------------------------------------------------------------
 
 void runViewer(u16 *vram)
 {
@@ -972,10 +1506,10 @@ void runViewer(u16 *vram)
         q[i] = malloc(FRAME_BYTES);
     tmp = malloc(TMP_BYTES);
     ring = memalign(32, RING_BYTES);
-    names = malloc(MAX_FILES * sizeof(names[0]));
-    sizesKb = malloc(MAX_FILES * sizeof(u32));
+    ents = malloc(MAX_FILES * sizeof(Entry));
+    albums = malloc(MAX_ALBUMS * sizeof(Album));
 
-    bool ok = tmp && ring && names && sizesKb;
+    bool ok = tmp && ring && ents && albums;
     for (int i = 0; i < NQ; i++)
         ok = ok && q[i];
 
@@ -999,112 +1533,146 @@ void runViewer(u16 *vram)
     else
     {
         tab = 0;
+        curAlbum = -1;
+        note[0] = 0;
+        numAlbums = 0;
         scanFiles();
         int sel = 0, top = 0;
+        int albumSel = 0;                              // remembered when opening an album
         bool redraw = true;
         int pressedBtn = 0;
         while (1)
         {
-            swiWaitForVBlank();
-            scanKeys();
-            u32 down = keysDown();
-            u32 rep = keysDownRepeat();
-
-            // Touch: tap a video to select it, tap it again (or Play) to watch
-            if (down & KEY_TOUCH)
-            {
-                touchPosition tp;
-                touchRead(&tp);
-                pressedBtn = uiHit(lbBack, tp.px, tp.py)   ? 1
-                           : uiHit(lbUp, tp.px, tp.py)     ? 2
-                           : uiHit(lbDown, tp.px, tp.py)   ? 3
-                           : uiHit(lbPlay, tp.px, tp.py)   ? 4
-                           : uiHit(lbDelete, tp.px, tp.py) ? 5
-                                                           : 0;
-                if (uiHit(tabVideos, tp.px, tp.py) || uiHit(tabPhotos, tp.px, tp.py))
-                {
-                    int want = uiHit(tabPhotos, tp.px, tp.py) ? 1 : 0;
-                    if (want != tab)
-                        down |= want ? KEY_R : KEY_L;
-                }
-                else if (pressedBtn == 0 && tp.py >= ITEM_Y0 && tp.py < ITEM_Y0 + ITEMS * ITEM_H)
-                {
-                    int i = top + (tp.py - ITEM_Y0) / ITEM_H;
-                    if (i < numFiles)
-                    {
-                        if (i == sel)
-                            down |= KEY_A;
-                        sel = i;
-                    }
-                }
-                redraw = true;
-            }
-            if (keysUp() & KEY_TOUCH)
-            {
-                if (pressedBtn == 1)
-                    down |= KEY_B;
-                if (pressedBtn == 2)
-                    rep |= KEY_UP;
-                if (pressedBtn == 3)
-                    rep |= KEY_DOWN;
-                if (pressedBtn == 4)
-                    down |= KEY_A;
-                if (pressedBtn == 5)
-                    down |= KEY_X;
-                pressedBtn = 0;
-                redraw = true;
-            }
-
-            if (down & KEY_B)
-                break;
-            if (((down & KEY_L) && tab == 1) || ((down & KEY_R) && tab == 0))
-            {
-                tab = !tab;
-                scanFiles();
-                sel = top = 0;
-                redraw = true;
-            }
-            if ((down & KEY_X) && numFiles > 0)
-            {
-                if (confirmDelete(names[sel]))
-                {
-                    char path[64];
-                    snprintf(path, sizeof(path), "%s/%s", tabDir(), names[sel]);
-                    unlink(path);
-                    scanFiles();
-                    if (sel >= numFiles)
-                        sel = numFiles > 0 ? numFiles - 1 : 0;
-                }
-                redraw = true;
-            }
-            if ((rep & KEY_DOWN) && sel < numFiles - 1)
-            {
-                sel++;
-                redraw = true;
-            }
-            if ((rep & KEY_UP) && sel > 0)
-            {
-                sel--;
-                redraw = true;
-            }
-            if ((down & KEY_A) && numFiles > 0)
-            {
-                if (tab)
-                    sel = viewPhotos(sel, vram);
-                else
-                    playFile(names[sel], vram);
-                redraw = true;
-            }
-
-            if (sel < top)
-                top = sel;
-            if (sel >= top + ITEMS)
-                top = sel - ITEMS + 1;
-
             if (redraw)
             {
-                drawList(sel, top, pressedBtn);
+                drawList(sel, top, pressedBtn, NULL);
                 redraw = false;
+            }
+            swiWaitForVBlank();
+            scanKeys();
+            u32 down = listInput(&sel, &top, &pressedBtn, &redraw);
+            bool albumMode = tab == 1 && curAlbum < 0;
+            int count = listCount();
+
+            if (down & KEY_B)
+            {
+                if (tab == 1 && curAlbum >= 0)          // album -> album list
+                {
+                    curAlbum = -1;
+                    scanAlbums();
+                    sel = albumSel < numAlbums ? albumSel : 0;
+                    top = sel >= ITEMS ? sel - ITEMS + 1 : 0;
+                    redraw = true;
+                    continue;
+                }
+                break;
+            }
+
+            // L/R: switch tab (at the top level)
+            if ((((down & KEY_L) && tab == 1) || ((down & KEY_R) && tab == 0)) &&
+                (tab == 0 || curAlbum < 0))
+            {
+                tab = !tab;
+                curAlbum = -1;
+                if (tab)
+                    scanAlbums();
+                else
+                    scanFiles();
+                sel = top = 0;
+                redraw = true;
+                continue;
+            }
+
+            if (tab == 0)
+            {
+                if ((down & KEY_X) && numFiles > 0)
+                {
+                    if (confirmDelete("Delete this video?", baseName(ents[sel].path), NULL))
+                    {
+                        unlink(ents[sel].path);
+                        scanFiles();
+                    }
+                    redraw = true;
+                }
+                if ((down & KEY_A) && numFiles > 0)
+                {
+                    playFile(baseName(ents[sel].path), vram);
+                    redraw = true;
+                }
+            }
+            else if (albumMode)
+            {
+                if (down & KEY_Y)                      // New album
+                {
+                    int n = newAlbum();
+                    if (n >= 0)
+                    {
+                        sel = n;
+                        setNote("Made album %.19s", albumLabel(n));
+                    }
+                    redraw = true;
+                }
+                if ((down & KEY_START) && count > 0)   // use as camera album
+                {
+                    if (canBeCameraAlbum(albums[sel].path))
+                    {
+                        photoSetSaveDir(albums[sel].path);
+                        setNote("Camera saves to %.14s", albumLabel(sel));
+                    }
+                    redraw = true;
+                }
+                if ((down & KEY_X) && count > 0 && sel > 0 && !albums[sel].system)
+                {
+                    char extra[32];
+                    snprintf(extra, sizeof(extra), "and its %d picture%s", albums[sel].count,
+                             albums[sel].count == 1 ? "" : "s");
+                    if (confirmDelete("Delete this album?", albumLabel(sel), extra))
+                    {
+                        char label[24];
+                        snprintf(label, sizeof(label), "%s", albumLabel(sel));
+                        if (!deleteAlbum(sel))
+                            setNote("Couldn't delete %.14s", label);
+                        scanAlbums();
+                    }
+                    redraw = true;
+                }
+                if ((down & KEY_A) && count > 0)       // open
+                {
+                    albumSel = sel;
+                    curAlbum = sel;
+                    scanFiles();
+                    sel = top = 0;
+                    redraw = true;
+                }
+            }
+            else
+            {
+                if ((down & KEY_START) && canBeCameraAlbum(albums[curAlbum].path))
+                {
+                    photoSetSaveDir(albums[curAlbum].path);
+                    setNote("Camera saves here%s", "");
+                    redraw = true;
+                }
+                if ((down & KEY_Y) && numFiles > 0)
+                {
+                    doMove(sel);
+                    redraw = true;
+                }
+                if ((down & KEY_X) && numFiles > 0 && !ents[sel].system)
+                {
+                    if (confirmDelete("Delete this photo?", baseName(ents[sel].path), NULL))
+                    {
+                        unlink(ents[sel].path);
+                        albums[curAlbum].count--;
+                        scanFiles();
+                    }
+                    redraw = true;
+                }
+                if ((down & KEY_A) && numFiles > 0)
+                {
+                    sel = viewPhotos(sel, vram);
+                    redraw = true;
+                }
             }
         }
     }
@@ -1113,6 +1681,8 @@ void runViewer(u16 *vram)
         free(q[i]);
     free(tmp);
     free(ring);
-    free(names);
-    free(sizesKb);
+    free(ents);
+    free(albums);
+    ents = NULL;
+    albums = NULL;
 }
