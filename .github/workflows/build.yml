@@ -10,6 +10,30 @@ jobs:
     container: skylyrac/blocksds:slim-latest
     steps:
       - uses: actions/checkout@v4
+      # Image decoders (both under permissive licenses, see source/lib)
+      - uses: actions/checkout@v4
+        with:
+          repository: nothings/stb
+          ref: d14d46f6b44456eb88beac58cba833a4135d4c89
+          path: ext/stb
+          sparse-checkout: stb_image.h
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@v4
+        with:
+          repository: blocksds/sdk
+          ref: 20d8cd66e9bc24ef5e7d38c34c39a0c3b627d7bc
+          path: ext/sdk
+          sparse-checkout: examples/demos/photo_slideshow
+      - name: Prepare
+        run: |
+          mkdir -p source/lib
+          cp ext/stb/stb_image.h source/lib/
+          S=ext/sdk/examples/demos/photo_slideshow
+          cp $S/source/tjpgd.h $S/source/tjpgdcnf.h source/lib/
+          cp $S/source/tjpgd.twl.c source/lib/tjpgd.c
+          cp $S/tjpgd.txt source/lib/TJPGD-LICENSE.txt
+          base64 -d icon.gif.b64 > icon.gif
+          rm -rf ext
       - name: Build
         run: make
       - uses: actions/upload-artifact@v4
